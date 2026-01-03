@@ -1,0 +1,295 @@
+/* ============================================================================
+   TEMA GERAL (DARK)
+   - Base: #1B1B1B (fundo principal) | Superfície: #303030 | Traço: #3A3A3A
+   - Texto principal: #EEEEEE | Texto secundário: #CCCCCC
+   ============================================================================ */
+
+/* ====== BACKGROUND / TEXTO PADRÃO ====== */
+QMainWindow {
+    background: qlineargradient(
+        x1: 0, y1: 0,
+        x2: 0, y2: 1,
+        stop: 0 #212121,
+        stop: 1 #212121
+    );
+}
+QWidget {
+    background-color: #212121;
+    color: #EEEEEE;
+    font-family: "Segoe UI", sans-serif;
+    font-size: 12px;
+}
+
+/* Superfícies do tipo “canvas” 2D */
+QGraphicsView {
+    background-color: #252525;
+    border-radius: 5px;
+    border: none;
+}
+
+/* ============================================================================
+   CONTROLES — BOTÕES
+   ============================================================================ */
+QPushButton,
+QToolButton {
+    font-size: 12px;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 10px;
+}
+QPushButton:hover,
+QToolButton:hover {
+    background-color: #3A3A3A;
+}
+QPushButton:pressed,
+QToolButton:pressed {
+    background-color: #1E1E1E;
+}
+
+/* Níveis do menu (LeftToolbar) */
+QPushButton#nivel1 { background-color: #275950; border-bottom: 3px solid #204941; }
+QPushButton#nivel1:hover { background-color: #245148; }
+QPushButton#nivel2 { background-color: #2A8C82; border-bottom: 3px solid #257C73; }
+QPushButton#nivel2:hover { background-color: #28847B; }
+QPushButton#nivel3 { background-color: #50B7A4; border-bottom: 2px solid #4AA796; }
+QPushButton#nivel3:hover { background-color: #4DAF9D; }
+
+/* ============================================================================
+   INPUTS / COMBOS
+   ============================================================================ */
+QLineEdit,
+QPlainTextEdit,
+QTextEdit,
+QSpinBox,
+QDoubleSpinBox,
+QComboBox,
+QListWidget,
+QTreeWidget,
+QTableWidget {
+    background-color: #2B2B2B;
+    color: #EEEEEE;
+    border: 1px solid #3A3A3A;
+    border-radius: 4px;
+    border-bottom: 1px solid #282828; /* sublinhado */
+    padding: 6px 8px;
+}
+QLineEdit:focus,
+QPlainTextEdit:focus,
+QTextEdit:focus,
+QComboBox:focus,
+QListWidget:focus,
+QTreeWidget:focus,
+QTableWidget:focus {
+    border: 1px solid #2A8C82;
+    border-bottom: 1px solid #2A8C82;
+}
+
+/* Popup (lista aberta) do QComboBox — texto claro */
+QComboBox QAbstractItemView {
+    background-color: #2B2B2B;
+    color: #FFFFFF;
+    selection-background-color: #646464;
+    selection-color: #FFFFFF;
+    outline: none;
+}
+
+/* ============================================================================
+   TABELAS
+   ============================================================================ */
+QTableView, QTableWidget {
+    background-color: #252525;
+    gridline-color: #2B2B2B;
+    border: 1px solid #3A3A3A;
+    border-radius: 5px;
+}
+QHeaderView::section {
+    background-color: #303030;
+    color: #EEEEEE;
+    padding: 6px;
+    border: none;
+    border-right: 1px solid #2B2B2B;
+    border-bottom: 1px solid #2B2B2B;
+}
+QTableCornerButton::section {
+    background: #303030;
+    border: none;
+    border-right: 1px solid #2B2B2B;
+    border-bottom: 1px solid #2B2B2B;
+}
+
+/* ============================================================================
+   PAINÉIS / ESTRUTURA
+   ============================================================================ */
+QFrame#left_toolbar {
+    background-color: #303030;
+    margin: 10px;
+    border-radius: 6px;
+    min-width: 220px;
+    max-width: 220px;
+}
+
+QFrame#main_windows {
+    border: none;
+    border-radius: 6px;
+    padding: 10px;
+}
+
+/* Linha superior e área de dados (direita) */
+#linha_toolbar {
+    background: #303030;
+    min-height: 75px;
+    max-height: 75px;
+    border-radius: 5px;
+    border: none;
+    margin: 0;
+    margin-bottom: 10px;
+    padding-left: 20px;
+    border-bottom: 1px solid #3A3A3A;
+}
+
+/* Toolbar superior do menu Individual (TbIndToolbar) */
+QWidget#tb_ind_toolbar {
+    background-color: #282828;
+    border: 1px solid #3A3A3A;
+    border-radius: 6px;
+}
+QWidget#tb_ind_toolbar QLabel,
+QWidget#tb_ind_toolbar QToolButton,
+QWidget#tb_ind_toolbar QPushButton {
+    color: #FFFFFF;
+}
+QWidget#tb_ind_toolbar QComboBox,
+QWidget#tb_ind_toolbar QLineEdit,
+QWidget#tb_ind_toolbar QSpinBox,
+QWidget#tb_ind_toolbar QDoubleSpinBox {
+    background-color: #2B2B2B;
+    color: #FFFFFF;
+    border: 1px solid #3A3A3A;
+    border-bottom: 1px solid #282828;
+    border-radius: 4px;
+}
+
+#janela_dados {
+    background: transparent;
+}
+
+/* ============================================================================
+   GRUPOS / SEÇÕES (wd_create_analise)
+   ============================================================================ */
+QGroupBox {
+    border: 1px solid #2E2E2E;
+    border-radius: 8px;
+    margin-top: 12px;
+    padding: 8px;
+    background: #282828;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 6px;
+    color: #DDDDDD;
+    background: transparent;
+    font-weight: 600;
+}
+
+/* ============================================================================
+   SPLITTER
+   ============================================================================ */
+QSplitter::handle { background: transparent; }
+QSplitter::handle:hover { background: transparent; }
+
+/* ============================================================================
+   MENSAGENS / DIALOGS
+   ============================================================================ */
+QMessageBox {
+    background-color: #212121;
+}
+QMessageBox QLabel {
+    color: #EEEEEE;
+    font-size: 12px;
+}
+QMessageBox QPushButton {
+    background-color: #2A8C82;
+    border-radius: 4px;
+    padding: 8px 12px;
+}
+QMessageBox QPushButton:hover {
+    background-color: #28847B;
+}
+
+QMessageBox#dark_success_msgbox {
+    background-color: #303030;
+    color: #FFFFFF;
+}
+QMessageBox#dark_success_msgbox QPushButton {
+    background-color: #3A3A3A;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 12px;
+    min-width: 72px;
+}
+QMessageBox#dark_success_msgbox QPushButton:hover { background-color: #454545; }
+QMessageBox#dark_success_msgbox QPushButton:pressed { background-color: #383838; }
+
+/* ScrollArea e viewport */
+QScrollArea {
+    background: #212121;
+    border: none;
+}
+QScrollArea > QWidget > QWidget {
+    background: #212121;
+}
+
+/* Defaults */
+QWidget {
+    background: #212121;
+    color: #EEEEEE;
+}
+QFrame {
+    background: #212121;
+    border: none;
+}
+
+/* ============================================================================
+   ESPECÍFICOS TB IND
+   ============================================================================ */
+#tb_ind_btn_criar {
+    background-color: #275950;
+    border-bottom: 3px solid #204941;
+}
+#tb_ind_btn_criar:hover { background-color: #245148; }
+
+/* Combobox fechada (widget principal) */
+QComboBox#tb_ind_combo_existentes {
+    min-width: 240px;
+    max-width: 240px;
+    background-color: #424242;
+    color: #FFFFFF;
+    border-bottom: 1px solid #3A3A3A;
+    font-size: 12px;
+}
+/* Popup da lista (QAbstractItemView do QComboBox) */
+QComboBox#tb_ind_combo_existentes QAbstractItemView {
+    background-color: #404040;
+    color: #FFFFFF;
+    selection-background-color: #303030;
+    selection-color: #FFFFFF;
+    outline: none;
+    min-width: 240px;
+}
+QComboBox#tb_ind_combo_existentes QAbstractItemView::item {
+    background-color: transparent;
+    color: #FFFFFF;
+}
+QComboBox#tb_ind_combo_existentes QAbstractItemView::item:selected {
+    background-color: #646464;
+    color: #FFFFFF;
+}
+
+/* Dialog criar rede */
+#create_ind_dialog {
+    background: #303030;
+    border-radius: 8px;
+}
