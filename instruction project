@@ -1,0 +1,557 @@
+# ZeniteV3 — Responsabilidade por arquivo (contrato para continuidade)
+
+> **Origem deste documento**
+>
+> Este documento foi elaborado com base no histórico de decisões e problemas discutidos no chat (layout imutável, specs dinâmicos, separação de responsabilidades, QSS centralizado, treino com engines e variação de assinaturas).
+>
+> **Regras inegociáveis**
+>
+> 1) **Layout das páginas não pode mudar** (especialmente `wd_training.py` e `wd_create_analise.py`).  
+> 2) **Valores padrão e configurações** devem estar no **config** (`config.ini` + `appconfig.py`).  
+> 3) UI **não pode depender** de assinatura instável do backend de treino → usar `pages/training/adapters.py`.  
+> 4) Troca de páginas/toolbars deve respeitar o contrato do `module_loader` (`"modulo:Classe"`).  
+> 5) Estilo visual deve estar em **`style/general_style.qss`** sempre que possível.
+
+---
+
+## 1) `main.py`
+
+### Responsabilidade
+- Ponto de entrada do aplicativo.
+- Inicializa QApplication.
+- Carrega config (via `AppConfig`).
+- Aplica estilo global (QSS).
+- Cria a janela principal (`MainWindow`).
+
+### Contratos / Restrições
+- Não colocar lógica de negócio aqui.
+- Não colocar lógica de treino/IA aqui.
+- Apenas “bootstrapping”.
+
+### Expansão futura
+- Configurar logging global.
+- Captura de exceções globais e handler (ex.: salvar log em arquivo).
+- Splash screen (sem quebrar UI atual).
+
+---
+
+## 2) `appconfig.py`
+
+### Responsabilidade
+- Ler e interpretar `config.ini`.
+- Expor acesso “amigável” às configs: paths, specs, defaults do treinamento, etc.
+- Ser o **único lugar** onde defaults do app são centralizados em código (quando não vierem do INI).
+
+### Contratos / Restrições
+- Sempre ter fallback caso campo não exista no INI.
+- Não importar UI pesada (evitar dependência circular).
+
+### Expansão futura
+- Validação de schema do INI.
+- Migração automática de config entre versões.
+
+---
+
+## 3) `config.ini`
+
+### Responsabilidade
+- Fonte primária de configuração:
+  - specs de páginas e toolbars (string no formato `"module:Class"`)
+  - valores padrão de treino (epochs, lr, batch, etc.)
+  - referências a estilo (qss path)
+  - preferências de UI
+
+### Contratos / Restrições
+- Todo “default” novo deve ser colocado aqui (e consumido por `appconfig.py`).
+- Mudança de spec implica mudança coordenada nos imports/classes.
+
+### Expansão futura
+- Seções padronizadas:
+  - `[modules]`, `[ui]`, `[training]`, `[paths]`
+- Versão do config para migrações.
+
+---
+
+## 4) `module_loader.py`
+
+### Responsabilidade
+- Carregar classes dinamicamente via spec:
+  - `"modulo:Classe"`
+  - Ex.: `"pages.wd_training:WdTrainingPane"`
+
+### Contratos / Restrições
+- Mensagens de erro precisam ser claras (ex.: módulo não encontrado / classe não encontrada / spec inválida).
+- Não pode “inventar” caminhos sem controle (mas pode tentar fallback com `pages.` se já previsto no projeto).
+
+### Expansão futura
+- Cache de imports.
+- Diagnóstico avançado (lista tentativas e sugestões).
+
+---
+
+## 5) `main_windows.py`
+
+### Responsabilidade
+- Janela/container principal do lado direito.
+- Gerencia e troca:
+  - **toolbar** (topo direito)
+  - **data pane** (conteúdo principal)
+- Mantém lógica de substituição segura do widget:
+  - remove widget antigo
+  - coloca novo widget
+  - evita vazamento de layout/referências
+
+### Contratos / Restrições
+- Não alterar a estrutura visual base da janela.
+- Trocas de widgets devem respeitar o formato do spec e o `module_loader`.
+
+### Expansão futura
+- Memória de estado por página (restaurar ao voltar).
+- Animação leve de transição (sem mudar layout).
+
+---
+
+## 6) `left_toolbar.py`
+
+### Responsabilidade
+- Menu lateral esquerdo.
+- Dispara a troca de:
+  - toolbar superior
+  - página principal
+- Mantém mapeamento “menu → specs”.
+
+### Contratos / Restrições
+- Não acoplar lógica de treino/IA aqui.
+- Estilo visual deve vir do QSS global (ex.: topo do “menu individual” mais claro).
+
+### Expansão futura
+- Construção dinâmica por config (menus definidos no INI).
+- Indicação clara da seleção atual.
+
+---
+
+## 7) `json_lib.py`
+
+### Responsabilidade
+- Funções utilitárias para JSON das IAs:
+  - carregar/salvar
+  - montar paths (`build_paths`)
+  - (idealmente) salvar de forma segura (atômica)
+
+### Contratos / Restrições
+- Não deve depender de UI.
+- Deve ser resiliente a JSON faltando campos.
+- **Evitar corromper JSON**: salvar com cuidado.
+
+### Expansão futura
+- Schema/validação.
+- Migração de versões do JSON.
+
+---
+
+## 8) `ia_context.py`
+
+### Responsabilidade
+- “Estado global” do app para a IA ativa:
+  - nome da IA selecionada (ex.: `get_name()`)
+  - dados auxiliares para UI
+- Disponibiliza acesso aos cenários/datasets:
+  - ex.: `get_dataset_builders()` (chave → função que gera `Sample[]`)
+
+### Contratos / Restrições
+- Métodos públicos devem ser estáveis (UI depende deles).
+- UI não pode acessar atributos privados (ex.: `_active_name`).
+- Se mudar API, atualizar adaptadores/consumidores.
+
+### Expansão futura
+- Eventos/sinais quando IA mudar (para UI atualizar automaticamente).
+- Multi-contexto (várias IAs abertas).
+
+---
+
+## 9) `ia_engine.py`
+
+### Responsabilidade
+- Criar engine de execução:
+  - preferir PyTorch quando disponível
+  - fallback para engine “Python puro” quando não estiver
+- `build_engine(...)` deve retornar algo que o treino consiga usar.
+
+### Contratos / Restrições
+- Nunca falhar só por PyTorch não existir.
+- Engine deve ser tratada como “plugável”.
+
+### Expansão futura
+- Seleção CPU/GPU e parâmetros no config.
+- Engine ONNX (inferência).
+
+---
+
+## 10) `ia_training.py`
+
+### Responsabilidade
+- Back-end de treino e avaliação:
+  - `train_networks(...)`
+  - `evaluate_networks(...)`
+- Define tipos/contratos de dados:
+  - `Sample`
+  - `TrainResult`
+  - `EvalResult`
+
+### Contratos / Restrições
+- **Assinatura pode evoluir**, mas isso não pode quebrar UI:
+  - UI **não chama diretamente** se assinatura variar
+  - quem adapta é `pages/training/adapters.py`
+- Deve emitir dados suficientes por época para gráficos (loss, acc, etc.), quando suportado.
+
+### Expansão futura
+- Callbacks padronizados (on_epoch, on_batch).
+- Early stopping, checkpoints.
+- Métricas adicionais (F1, confusion matrix).
+
+---
+
+## 11) `ia_generational.py`
+
+### Responsabilidade
+- Evolução / geração de arquiteturas:
+  - configuração de mutações (`MutationConfig`)
+  - criação de indivíduos (`create_generation_individual`)
+  - ranking (`rank_top_k`)
+- Alimenta a UI com os “tops” para exibição.
+
+### Contratos / Restrições
+- Estrutura de retorno dos “tops” deve ser consistente (UI/plots dependem).
+- Regras de mutação devem respeitar limites (camadas/neuronios) e flags.
+
+### Expansão futura
+- Algoritmos multiobjetivo.
+- Penalidade por complexidade (neurônios/camadas).
+- Persistência e reuso de melhores indivíduos.
+
+---
+
+## 12) `ia_manifest.py`
+
+### Responsabilidade
+- Registro/descoberta das IAs disponíveis:
+  - lista de modelos/arquivos
+  - metadados (versão, stats, etc.)
+
+### Contratos / Restrições
+- Não depende de UI.
+- Deve suportar ausência de arquivos e inconsistências.
+
+### Expansão futura
+- Versionamento formal do modelo.
+- Compatibilidade retroativa via migração.
+
+---
+
+## 13) `train_datasets.py`
+
+### Responsabilidade
+- Catálogo de cenários/datasets de treino.
+- Cada cenário deve retornar dados no formato esperado (`Sample[]`).
+- Alimenta o combo de dataset no `wd_training`.
+
+### Contratos / Restrições
+- Não depender de UI.
+- Deve ser determinístico quando necessário (seed opcional).
+- Deve documentar a saída (classes, inputs/outputs).
+
+### Expansão futura
+- Datasets com janelas temporais, séries financeiras, OHLCV etc.
+- Cache de dataset (evitar recomputar).
+
+---
+
+## 14) `ui_functions.py`
+
+### Responsabilidade
+- Funções utilitárias de UI reutilizáveis:
+  - criar botões padronizados
+  - estilos comuns
+  - atalhos de layout
+- Evita repetição em vários módulos.
+
+### Contratos / Restrições
+- Não deve “quebrar” componentes existentes ao mudar assinatura.
+- Funções públicas devem ser estáveis (ex.: se `create_button` existe, não renomear sem atualizar tudo).
+- Ideal: não acoplar a páginas específicas.
+
+### Expansão futura
+- Factory de componentes (botões, inputs, headers).
+- Helpers para aplicar propriedades de estilo (objectName, classes, etc.)
+
+---
+
+# 15) Pasta `pages/`
+
+> **Regra crítica:** páginas são carregadas via `module_loader` e specs.  
+> Portanto **classe e caminho importável devem ser estáveis**.
+
+---
+
+## 15.1) `pages/wd_training.py`
+
+### Responsabilidade
+- Página de treino com layout fixo.
+- Orquestra o fluxo:
+  1) Carregar lista de datasets
+  2) Preparar treino (split treino/validação)
+  3) Treinar (thread)
+  4) Avaliar
+  + recursos geracionais (mutação/top-k)
+- Integra com `pages/training/*` para separar responsabilidades.
+
+### Contratos / Restrições
+- **Layout não pode mudar.**
+- Combo de dataset é funcionalidade crítica e deve funcionar.
+- Não chamar `ia_training` diretamente se houver risco de assinatura variar → usar `training/controller.py` (ou `adapters.py`).
+
+### Expansão futura
+- Persistência do estado UI (último dataset).
+- Mais métricas e gráficos com downsampling (sem travar).
+
+---
+
+## 15.2) `pages/wd_create_analise.py`
+
+### Responsabilidade
+- Página de criação/inspeção de redes.
+- Integra a visão da rede (NetworkView).
+- Controla fluxos de criação/salvar/configurar.
+
+### Contratos / Restrições
+- **Layout não pode mudar.**
+- Rede deve ser desenhada:
+  - centralizada (vertical/horizontal)
+  - compacta e organizada
+  - espaçamento vertical uniforme
+  - labels de camadas (Entrada, Camada 1..N, Saída)
+  - ligações visíveis (sem fundo preto “extra” — respeitar background do app)
+
+### Expansão futura
+- Zoom/pan.
+- Exibir pesos, ativação ou importância por conexão.
+
+---
+
+# 15.3) `pages/individual/`
+
+## 15.3.1) `pages/individual/dialogs/create_ind_dialogs.py`
+
+### Responsabilidade
+- Diálogos de criação de indivíduo/IA (formulários, validação, salvar).
+- Deve ser acionado pela toolbar do menu individual.
+
+### Contratos / Restrições
+- Não mudar layout sem necessidade (diálogo também é UX).
+- Não misturar lógica de treino aqui.
+
+### Expansão futura
+- Wizard de criação.
+- Presets por tipo de rede.
+
+---
+
+## 15.3.2) `pages/individual/network_view/network_view.py`
+
+### Responsabilidade
+- Visualização da arquitetura:
+  - neurônios por camada
+  - conexões entre camadas
+  - dimensionamento automático com base em camadas/neuronios
+  - render coerente com o tema (sem “fundo preto” indevido)
+
+### Contratos / Restrições
+- Deve ser responsivo: ajustar tamanho ao conteúdo.
+- Espaçamento uniforme e centralização sempre.
+
+### Expansão futura
+- Hover tooltips.
+- Indicadores por neurônio (peso médio, ativação).
+
+---
+
+## 15.3.3) `pages/individual/toolbar/tb_ind_toolbar.py`
+
+### Responsabilidade
+- Toolbar do menu “individual”.
+- Ações típicas:
+  - criar indivíduo
+  - carregar/selecionar indivíduo
+  - abrir diálogo
+- Deve ter destaque visual (background #282828 ou similar via QSS).
+
+### Contratos / Restrições
+- Não “injetar” QSS direto no código se puder estar no `general_style.qss`.
+- Exportar a classe esperada pela spec.
+
+### Expansão futura
+- ações extras (exportar, duplicar, versionar).
+
+---
+
+# 15.4) `pages/training/`
+
+> Módulos auxiliares do treino.  
+> **Ideia:** UI chama Controller → Controller usa Adapters/Workers/State/Config → Plots atualiza UI.
+
+---
+
+## 15.4.1) `pages/training/adapters.py`
+
+### Responsabilidade
+- Camada de compatibilidade entre UI/Controller e `ia_training.py`.
+- Resolver variação de assinatura:
+  - filtrar kwargs
+  - mapear nomes (ex.: `on_epoch` vs `on_epoch_metrics`)
+  - suportar ou ignorar `engine=...` conforme disponível
+
+### Contratos / Restrições
+- Não depende de UI.
+- Deve ser a “válvula de segurança” que impede regressões do treino.
+
+### Expansão futura
+- testes unitários para assinaturas diferentes.
+
+---
+
+## 15.4.2) `pages/training/config.py`
+
+### Responsabilidade
+- Tipos/configs do treino consumidos por Controller/Workers:
+  - epochs, lr, lr_mult, lr_min, batch
+  - eval_limit, shuffle
+  - políticas de atualização de gráficos
+- Valores default devem vir do `AppConfig`.
+
+### Contratos / Restrições
+- Não hardcode de defaults aqui (buscar no config principal).
+- Ser “dataclass-friendly”.
+
+### Expansão futura
+- config para early stopping, checkpoint.
+
+---
+
+## 15.4.3) `pages/training/controller.py`
+
+### Responsabilidade
+- Orquestrador do treino (sem UI):
+  - valida estado (tem dataset? tem IA ativa?)
+  - prepara job de treino
+  - cria workers/threads
+  - define callbacks e emite eventos para UI
+
+### Contratos / Restrições
+- UI não deve conhecer detalhes do backend.
+- Controller deve ser testável sem GUI.
+
+### Expansão futura
+- fila de jobs de treino.
+- treino em múltiplas redes.
+
+---
+
+## 15.4.4) `pages/training/plots.py`
+
+### Responsabilidade
+- Atualização de gráficos (pyqtgraph):
+  - min/max
+  - loss por época
+  - lr
+  - performance
+  - distribuição
+  - acurácia
+- Política de exibição:
+  - mostrar original e/ou top-k
+
+### Contratos / Restrições
+- Não alterar layout; apenas atualizar dados e itens do plot.
+- Deve ser tolerante a históricos incompletos.
+
+### Expansão futura
+- downsampling para performance.
+- exportar gráficos.
+
+---
+
+## 15.4.5) `pages/training/state.py`
+
+### Responsabilidade
+- Estado interno do treinamento (modelo de dados):
+  - histórico por rede
+  - epochs registradas
+  - métricas atuais
+  - “best candidate” e “tops”
+- Serve como “single source of truth” do treino na página.
+
+### Contratos / Restrições
+- Não depende de UI.
+- Deve permitir reset claro do estado.
+
+### Expansão futura
+- persistência do estado (salvar/recuperar sessão).
+
+---
+
+## 15.4.6) `pages/training/workers.py`
+
+### Responsabilidade
+- Execução em background (threads):
+  - TrainWorker
+  - EvalWorker
+- Emite sinais com métricas por época e logs.
+- Usa `adapters.py` para chamar `ia_training` com segurança.
+
+### Contratos / Restrições
+- Worker nunca altera UI diretamente.
+- Cancelamento/stop deve ser suportado.
+- Não travar thread principal.
+
+### Expansão futura
+- suporte a múltiplos workers simultâneos.
+- prioridade e throttling.
+
+---
+
+# 16) Pasta `style/`
+
+## 16.1) `style/general_style.qss`
+
+### Responsabilidade
+- Tema global do app:
+  - background geral
+  - inputs (QLineEdit/QSpinBox/QDoubleSpinBox etc.)
+  - texto claro quando fundo é escuro
+  - underline/indicador de foco (ex.: #282828 quando solicitado)
+  - toolbars com contraste (ex.: “individual” mais claro)
+
+### Contratos / Restrições
+- Evitar tornar tudo “preto absoluto”.
+- Manter legibilidade.
+- Se um widget precisa de estilo específico:
+  - usar `objectName` e regras QSS direcionadas,
+  - ou classes (quando aplicável).
+
+### Expansão futura
+- Quebra em múltiplos QSS (base/components/pages) mas carregado como um único tema.
+
+---
+
+## Checklist de segurança para o próximo chat (antes de entregar alterações)
+
+1) O layout visual mudou? **Se sim, rejeitar.**
+2) O combo de dataset funciona (Carregar → listar / Preparar → split)?  
+3) Treino inicia sem erro de kwargs? (ex.: `engine=`)  
+4) Stop funciona sem travar UI?  
+5) Plots atualizam sem alterar layout?  
+6) Defaults vêm do config, não hardcode?  
+7) Specs (`module:Class`) continuam válidas?
+
+---
+
+**Fim do documento.**
