@@ -570,7 +570,9 @@ class WdTrainingPane(QWidget):
 
     def _load_lr_from_json(self, ia_name: str) -> None:
         try:
-            _, manifest_path, _, _ = build_paths(ia_name)
+            # build_paths() retorna: (pasta, arquivo_json, nome_sanitizado)
+            _, manifest_path, _ = build_paths(ia_name)
+
             manifest = load_json(manifest_path) or {}
             trn = manifest.get("training", {}) or {}
             lr = trn.get("learning_rate", None)
