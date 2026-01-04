@@ -20,10 +20,14 @@ class MutationConfig:
     max_neuron_delta: int
 
 
-def _ensure_gen_dir(parent_name: str) -> Path:
-    """Garante a pasta de geração para o parent: dados/{parent}/geracao"""
-    parent_folder, _, parent_sanit = build_paths(parent_name)
-    # parent_folder aqui é dados/{parent_sanit}
+def _ensure_gen_dir(parent_folder: Path) -> Path:
+    """
+    Garante a pasta de geração para o parent:
+        dados/{parent}/geracao
+
+    Nota: recebemos parent_folder diretamente (evita recomputar build_paths e
+    possíveis edge-cases de nomes com underscores/dígitos).
+    """
     gen_dir = parent_folder / "geracao"
     gen_dir.mkdir(parents=True, exist_ok=True)
     return gen_dir
@@ -232,7 +236,7 @@ def create_generation_individual(
     Retorna o nome do indivíduo (para train_networks/build_engine).
     """
     parent_folder, parent_json, parent_sanit = build_paths(parent_name)
-    gen_dir = _ensure_gen_dir(parent_sanit)
+    gen_dir = _ensure_gen_dir(parent_folder)
 
     if not parent_json.exists():
         raise FileNotFoundError(f"Manifesto do parent não encontrado: {parent_json}")
@@ -250,6 +254,8 @@ def create_generation_individual(
     ident["parent"] = parent_sanit
     ident["generation"] = int(generation_index)
     ident["individual_id"] = int(individual_id)
+
+    # Mantém compatibilidade: o projeto costuma guardar o nome como "arquivo"
     ident["name"] = f"{child_name}.json"
     child_data["identification"] = ident
 
@@ -280,12 +286,27 @@ def create_generation_individual(
 
 
 def rank_top_k(results: List[Dict[str, Any]], k: int = 3) -> List[Dict[str, Any]]:
-    """Ordena por acc desc e loss asc."""
-    def key(r):
-        acc = r.get("acc")
-        loss = r.get("loss")
-        acc = float(acc) if acc is not None else -1.0
-        loss = float(loss) if loss is not None else 1e18
+    """
+    Ordena resultados por:
+      - accuracy/acc desc
+      - loss/final_loss/loss_final asc
+
+    Aceita chaves alternativas para manter compatibilidade entre versões.
+    """
+    kk = max(1, int(k))
+
+    def _get_float(d: Dict[str, Any], keys: List[str], default: float) -> float:
+        for key in keys:
+            if key in d and d[key] is not None:
+                try:
+                    return float(d[key])
+                except Exception:
+                    pass
+        return float(default)
+
+    def key(r: Dict[str, Any]) -> Tuple[float, float]:
+        acc = _get_float(r, ["accuracy", "acc"], default=-1.0)
+        loss = _get_float(r, ["loss", "final_loss", "loss_final", "avg_loss", "loss_avg"], default=1e18)
         return (-acc, loss)
 
-    return sorted(results, key=key)[: max(1, int(k))]
+    return sorted(results, key=key)[:kk]

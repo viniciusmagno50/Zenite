@@ -8,7 +8,7 @@
 #   - Para TREINO com backprop, é necessário PyTorch.
 #   - Se PyTorch não estiver disponível:
 #       * inferência/avaliação continua funcionando via forward em Python
-#       * funções de treino avisam e não treinam
+#       * treino NÃO deve derrubar o app: vira "no-op" com aviso (contrato ZeniteV3)
 # -----------------------------------------------------------
 
 from __future__ import annotations
@@ -238,6 +238,30 @@ ProgressCallback = Callable[
 #   False -> interromper o treinamento daquela rede
 
 
+def _softmax_stable(logits: Sequence[float]) -> List[float]:
+    if not logits:
+        return []
+    m = max(float(x) for x in logits)
+    exps = [math.exp(float(x) - m) for x in logits]
+    s = sum(exps)
+    if s <= 0:
+        return [0.0 for _ in exps]
+    return [v / s for v in exps]
+
+
+def _cross_entropy_from_logits(logits: Sequence[float], y_true: int) -> float:
+    """
+    Loss cross-entropy (NLL) a partir de logits (saída linear do forward python).
+    """
+    probs = _softmax_stable(logits)
+    if not probs:
+        return float("nan")
+    if y_true < 0 or y_true >= len(probs):
+        return float("nan")
+    p = max(1e-12, float(probs[y_true]))
+    return -math.log(p)
+
+
 def train_networks(
     network_names: Sequence[str],
     data: Sequence[Sample],
@@ -259,19 +283,121 @@ def train_networks(
     Se progress_callback for fornecido, será chamado durante o treino (por batch)
     com informações de progresso e pode retornar False para interromper
     o treinamento da rede atual.
-    """
-    if not _TORCH_AVAILABLE:
-        raise RuntimeError(
-            "PyTorch não está disponível. Não é possível executar o treinamento.\n"
-            "Instale torch na máquina de treino ou use apenas inferência."
-        )
 
+    IMPORTANTE (contrato ZeniteV3):
+      - Sem PyTorch: não derruba o app.
+        O treino vira "no-op" (sem atualizar pesos), mas retorna métricas/loss
+        calculadas via forward Python para manter UI funcional.
+    """
     if not data:
         raise ValueError("Lista de dados de treino está vazia.")
 
-    # Converte para lista fixa (caso venha como iterador)
     data_list: List[Sample] = list(data)
     results: Dict[str, TrainResult] = {}
+
+    # ------------------------------
+    # Modo sem PyTorch: no-op training
+    # ------------------------------
+    if not _TORCH_AVAILABLE:
+        if verbose:
+            print(
+                "[TRAIN] PyTorch não está disponível. "
+                "Treino com backprop desativado (no-op). "
+                "Calculando loss por forward Python, sem atualizar pesos."
+            )
+
+        total_samples = len(data_list)
+        total_steps = total_samples * max(1, int(n_epochs))
+        bs = max(1, int(batch_size))
+
+        for name in network_names:
+            manifest, path_json = load_manifest_by_name(name)
+            st = manifest.structure
+            weights = st.weights or []
+            activation = list(st.activation or [])
+
+            losses_all: List[float] = []
+            step_counter = 0
+            stop_requested = False
+            t0 = time.perf_counter()
+
+            for epoch in range(max(1, int(n_epochs))):
+                indices = list(range(total_samples))
+                if shuffle:
+                    random.shuffle(indices)
+
+                for pos in range(0, len(indices), bs):
+                    batch_idx = indices[pos : pos + bs]
+
+                    # "no-op": apenas calcula loss média do batch
+                    batch_losses: List[float] = []
+                    for idx in batch_idx:
+                        x_vals, y_true = data_list[idx]
+                        logits = _forward_python(weights, activation, x_vals)
+                        batch_losses.append(_cross_entropy_from_logits(logits, int(y_true)))
+
+                    # loss do passo (batch) como média
+                    loss_val = float(sum(batch_losses) / max(1, len(batch_losses)))
+                    losses_all.append(loss_val)
+
+                    step_counter += int(len(batch_idx))
+
+                    if progress_callback is not None:
+                        should_continue = progress_callback(
+                            name,
+                            step_counter,
+                            total_steps,
+                            epoch + 1,
+                            max(1, int(n_epochs)),
+                            loss_val,
+                        )
+                        if not should_continue:
+                            stop_requested = True
+                            break
+
+                if stop_requested:
+                    if verbose:
+                        print(
+                            f"[TRAIN] No-op treino de '{name}' interrompido pelo usuário "
+                            f"na época {epoch + 1}."
+                        )
+                    break
+
+            elapsed = time.perf_counter() - t0
+            if losses_all:
+                final_loss = float(losses_all[-1])
+                avg_loss = float(sum(losses_all) / float(len(losses_all)))
+            else:
+                final_loss = math.nan
+                avg_loss = math.nan
+
+            # Não altera pesos (no-op). Salva manifesto opcionalmente? Aqui NÃO precisa.
+            # Mantemos o arquivo intacto para evitar falsa impressão de "treinou".
+
+            if verbose:
+                print(
+                    f"[TRAIN] (no-op) '{name}': "
+                    f"samples={total_samples}, req_epochs={int(n_epochs)}, "
+                    f"steps={step_counter}/{total_steps}, "
+                    f"final_loss={final_loss:.6g}, avg_loss={avg_loss:.6g}, "
+                    f"time={elapsed:.2f}s"
+                )
+
+            results[name] = TrainResult(
+                name=name,
+                samples=total_samples,
+                epochs=0,  # <- indica que NÃO houve backprop
+                final_loss=final_loss,
+                avg_loss=avg_loss,
+                elapsed_seconds=float(elapsed),
+            )
+
+        return results
+
+    # ------------------------------
+    # Modo com PyTorch: treino real
+    # ------------------------------
+    results = {}
 
     for name in network_names:
         manifest, path_json = load_manifest_by_name(name)
@@ -290,7 +416,6 @@ def train_networks(
         stop_requested = False
 
         for epoch in range(int(n_epochs)):
-            # Embaralha a ordem dos índices se solicitado
             indices = list(range(total_samples))
             if shuffle:
                 random.shuffle(indices)
@@ -323,7 +448,6 @@ def train_networks(
 
                 step_counter += int(len(batch_idx))
 
-                # callback de progresso (step_counter é contado em *amostras*)
                 if progress_callback is not None:
                     should_continue = progress_callback(
                         name,
@@ -335,7 +459,7 @@ def train_networks(
                     )
                     if not should_continue:
                         stop_requested = True
-                        break  # sai do loop de batches
+                        break
 
             if stop_requested:
                 if verbose:
@@ -343,7 +467,7 @@ def train_networks(
                         f"[TRAIN] Treinamento de '{name}' interrompido pelo usuário "
                         f"na época {epoch + 1}."
                     )
-                break  # sai do loop de épocas
+                break
 
         elapsed = time.perf_counter() - t0
 
@@ -448,7 +572,6 @@ def evaluate_networks(
         use_torch = _TORCH_AVAILABLE
 
         if use_torch:
-            # Monta modelo em PyTorch para avaliação
             model = JsonNetwork(manifest).to(_DEVICE)  # type: ignore[arg-type]
             model.eval()
             criterion = torch.nn.CrossEntropyLoss()  # type: ignore[union-attr]
@@ -480,9 +603,7 @@ def evaluate_networks(
                         )
                         losses.append(float(loss.item()))
             else:
-                # Python puro
                 out = _forward_python(weights, activation, x_vals)
-                # argmax manual
                 max_idx = 0
                 max_val = float("-inf")
                 for i, v in enumerate(out):
@@ -491,16 +612,17 @@ def evaluate_networks(
                         max_idx = i
                 pred_cls = max_idx
 
+                # loss opcional no modo python (mantém avg_loss mais útil)
+                ce = _cross_entropy_from_logits(out, y_true)
+                if not math.isnan(ce):
+                    losses.append(float(ce))
+
             if pred_cls == y_true:
                 correct += 1
 
         elapsed = time.perf_counter() - t0
         accuracy = correct / float(total_data)
-        avg_loss = (
-            float(sum(losses) / float(len(losses)))
-            if losses
-            else None
-        )
+        avg_loss = float(sum(losses) / float(len(losses))) if losses else None
         avg_time_per_sample = elapsed / float(total_data)
 
         if verbose:
@@ -520,7 +642,6 @@ def evaluate_networks(
             )
         )
 
-    # Ordena: maior accuracy, menor tempo, menor loss (quando disponível)
     def _sort_key(r: EvalResult):
         loss_key = r.avg_loss if r.avg_loss is not None else float("inf")
         return (-r.accuracy, r.avg_time_per_sample, loss_key)
