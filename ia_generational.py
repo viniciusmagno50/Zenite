@@ -14,21 +14,36 @@ class MutationConfig:
     allow_add_layers: bool
     allow_remove_layers: bool
     max_layer_delta: int
-
     allow_add_neurons: bool
     allow_remove_neurons: bool
     max_neuron_delta: int
 
 
-def _ensure_gen_dir(parent_folder: Path) -> Path:
-    """
-    Garante a pasta de geração para o parent:
-        dados/{parent}/geracao
+def _ensure_gen_dir(parent_name: str) -> Path:
+    """Garante a pasta de geração SEMPRE em dados/{root_parent}/geracao.
 
-    Nota: recebemos parent_folder diretamente (evita recomputar build_paths e
-    possíveis edge-cases de nomes com underscores/dígitos).
+    Suporta receber tanto:
+      - nome do parent raiz (ex.: 'PETR4')
+      - nome de um indivíduo geracional (ex.: 'PETR4_3_12')
+
+    Isso evita criar estruturas aninhadas do tipo:
+      dados/PETR4_3_12/geracao (INCORRETO)
+    e garante que tudo fique em:
+      dados/PETR4/geracao (CORRETO).
     """
-    gen_dir = parent_folder / "geracao"
+    parent_folder, _, parent_sanit = build_paths(parent_name)
+
+    # Se build_paths detectou que parent_name é geracional, parent_folder será:
+    #   dados/{root_parent}/geracao
+    # então o root_parent é o diretório pai.
+    if parent_folder.name == "geracao":
+        root_parent = parent_folder.parent.name
+    else:
+        root_parent = parent_sanit
+
+    root_folder, _, root_sanit = build_paths(root_parent)
+    # root_folder aqui é dados/{root_sanit}
+    gen_dir = root_folder / "geracao"
     gen_dir.mkdir(parents=True, exist_ok=True)
     return gen_dir
 
@@ -44,182 +59,70 @@ def _extract_structure_neurons(struct: Dict[str, Any]) -> Tuple[List[int], Optio
         except Exception:
             neurons = None
 
-    if isinstance(neurons, (int, float)):
-        neurons = [int(neurons)]
-
     if not isinstance(neurons, list) or not neurons:
         return [], None
 
-    out_size = struct.get("output_size")
-    if isinstance(out_size, (int, float)) and int(out_size) > 0:
-        out_size = int(out_size)
-    else:
-        out_size = None
+    clean: List[int] = []
+    for v in neurons:
+        try:
+            iv = int(v)
+        except Exception:
+            continue
+        if iv > 0:
+            clean.append(iv)
 
-    if out_size is not None and int(neurons[-1]) == int(out_size):
-        hidden = [int(x) for x in neurons[:-1]] or []
-        return hidden, out_size
+    if len(clean) < 2:
+        return clean, None
 
-    return [int(x) for x in neurons], None
-
-
-def _write_structure_neurons(struct: Dict[str, Any], hidden: List[int], output_fixed: Optional[int]) -> None:
-    neurons_out: List[int] = [max(1, int(x)) for x in (hidden or [8])]
-    if output_fixed is not None:
-        neurons_out.append(int(output_fixed))
-
-    struct["neurons"] = neurons_out
-    struct["layers"] = len(neurons_out)
+    # Heurística: se tiver pelo menos 2 camadas, assume que a última é saída fixa
+    out_size = clean[-1]
+    hidden = clean[:-1]
+    return hidden, out_size
 
 
-def _resize_weights_like(input_size: int, neurons: List[int], old_weights: Any) -> List[List[List[float]]]:
-    """Ajusta weights para bater com input_size e neurons, preservando o máximo possível."""
-    if input_size <= 0:
-        input_size = 1
+def _mutate_hidden_layers(hidden: List[int], cfg: MutationConfig) -> List[int]:
+    """Aplica mutações nas camadas ocultas."""
+    mutated = list(hidden)
 
-    if not isinstance(old_weights, list):
-        old_weights = []
+    # Adiciona/remove camadas
+    if cfg.allow_add_layers and cfg.max_layer_delta > 0:
+        add_n = random.randint(0, cfg.max_layer_delta)
+        for _ in range(add_n):
+            # adiciona camada com tamanho similar às existentes (ou default)
+            base = mutated[-1] if mutated else 8
+            delta = random.randint(-max(1, cfg.max_neuron_delta), max(1, cfg.max_neuron_delta)) if cfg.max_neuron_delta > 0 else 0
+            mutated.append(max(1, base + delta))
 
-    new_weights: List[List[List[float]]] = []
-    prev_in = int(input_size)
+    if cfg.allow_remove_layers and cfg.max_layer_delta > 0 and mutated:
+        rem_n = random.randint(0, min(cfg.max_layer_delta, len(mutated)))
+        for _ in range(rem_n):
+            if mutated:
+                mutated.pop(random.randrange(0, len(mutated)))
 
-    for li, n_out in enumerate(neurons):
-        n_out = max(1, int(n_out))
-        old_layer = old_weights[li] if li < len(old_weights) and isinstance(old_weights[li], list) else []
-        layer_rows: List[List[float]] = []
+    # Adiciona/remove neurônios em camadas existentes
+    if cfg.max_neuron_delta > 0 and mutated:
+        for i in range(len(mutated)):
+            if cfg.allow_add_neurons and random.random() < 0.50:
+                mutated[i] += random.randint(0, cfg.max_neuron_delta)
+            if cfg.allow_remove_neurons and random.random() < 0.50:
+                mutated[i] -= random.randint(0, cfg.max_neuron_delta)
+            mutated[i] = max(1, mutated[i])
 
-        for ni in range(n_out):
-            if ni < len(old_layer) and isinstance(old_layer[ni], list) and len(old_layer[ni]) >= 1:
-                row = old_layer[ni]
-                try:
-                    bias = float(row[0])
-                except Exception:
-                    bias = 0.0
-
-                w_raw = row[1:] if len(row) > 1 else []
-                w: List[float] = []
-                for x in w_raw:
-                    try:
-                        w.append(float(x))
-                    except Exception:
-                        w.append(0.0)
-            else:
-                bias = random.uniform(-0.05, 0.05)
-                w = [random.uniform(-0.05, 0.05) for _ in range(prev_in)]
-
-            if len(w) < prev_in:
-                w += [random.uniform(-0.05, 0.05) for _ in range(prev_in - len(w))]
-            elif len(w) > prev_in:
-                w = w[:prev_in]
-
-            layer_rows.append([bias] + w)
-
-        new_weights.append(layer_rows)
-        prev_in = n_out
-
-    return new_weights
-
-
-def _sync_structure_after_mutation(struct: Dict[str, Any]) -> None:
-    """Garante consistência mínima do structure após mutação."""
-    input_size = int(struct.get("input_size") or 0)
-    out_size = int(struct.get("output_size") or 0)
-
-    neurons_raw = struct.get("neurons") or []
-    if isinstance(neurons_raw, str):
-        parts = [p.strip() for p in neurons_raw.split(",") if p.strip()]
-        neurons = [int(p) for p in parts] if parts else []
-    elif isinstance(neurons_raw, (int, float)):
-        neurons = [int(neurons_raw)]
-    else:
-        neurons = [int(x) for x in neurons_raw] if isinstance(neurons_raw, list) else []
-
-    if not neurons:
-        neurons = [max(1, out_size or 1)]
-
-    if out_size > 0 and int(neurons[-1]) != out_size:
-        neurons[-1] = out_size
-
-    neurons = [max(1, int(x)) for x in neurons]
-    struct["neurons"] = neurons
-    struct["layers"] = len(neurons)
-
-    act = struct.get("activation") or []
-    if isinstance(act, (str, type(None))):
-        activation: List[Optional[str]] = [act] * len(neurons)
-    elif isinstance(act, list):
-        activation = [a if (a is None or isinstance(a, str)) else None for a in act]
-    else:
-        activation = []
-
-    if len(activation) < len(neurons):
-        activation += [None] * (len(neurons) - len(activation))
-    elif len(activation) > len(neurons):
-        activation = activation[: len(neurons)]
-    struct["activation"] = activation
-
-    struct["weights"] = _resize_weights_like(input_size, neurons, struct.get("weights"))
-
-
-def mutate_manifest(manifest: Dict[str, Any], cfg: MutationConfig) -> Dict[str, Any]:
-    """Aplica mutação no structure (camadas/neurônios), sem alterar input/output_size."""
-    out = copy.deepcopy(manifest)
-    struct = out.get("structure") or {}
-    if not isinstance(struct, dict):
-        struct = {}
-    out["structure"] = struct
-
-    hidden, output_fixed = _extract_structure_neurons(struct)
-    if not hidden:
-        hidden = [8]
-
-    max_ld = max(0, int(cfg.max_layer_delta))
-    if max_ld > 0:
-        if cfg.allow_add_layers:
-            add_n = random.randint(0, max_ld)
-            for _ in range(add_n):
-                base = int(sum(hidden) / len(hidden)) if hidden else 8
-                new_n = max(1, int(base + random.randint(-max(1, base // 4), max(1, base // 4))))
-                hidden.append(new_n)
-
-        if cfg.allow_remove_layers:
-            rem_n = random.randint(0, max_ld)
-            for _ in range(rem_n):
-                if len(hidden) <= 1:
-                    break
-                idx = random.randrange(0, len(hidden))
-                hidden.pop(idx)
-
-    max_nd = max(0, int(cfg.max_neuron_delta))
-    if max_nd > 0 and hidden:
-        idx = random.randrange(0, len(hidden))
-        delta = random.randint(0, max_nd)
-
-        if cfg.allow_add_neurons and delta > 0:
-            hidden[idx] = max(1, hidden[idx] + delta)
-
-        if cfg.allow_remove_neurons and delta > 0:
-            hidden[idx] = max(1, hidden[idx] - delta)
-
-    _write_structure_neurons(struct, hidden, output_fixed)
-    _sync_structure_after_mutation(struct)
-    return out
+    return mutated
 
 
 def _find_parent_weight_file(parent_folder: Path, parent_sanit: str) -> Optional[Path]:
-    """Procura arquivo de pesos do parent (opcional)."""
+    """Procura arquivo de pesos do parent (se existir)."""
+    # tentativas comuns
     candidates = [
         parent_folder / f"{parent_sanit}.pth",
         parent_folder / f"{parent_sanit}.pt",
         parent_folder / f"{parent_sanit}.bin",
+        parent_folder / f"{parent_sanit}.weights",
     ]
     for p in candidates:
         if p.exists():
             return p
-    for suf in (".pth", ".pt", ".bin"):
-        for p in parent_folder.glob(f"{parent_sanit}*{suf}"):
-            if p.is_file():
-                return p
     return None
 
 
@@ -231,12 +134,13 @@ def create_generation_individual(
 ) -> str:
     """
     Cria um indivíduo e salva em:
-      dados/{parent}/geracao/{parent}_{geracao}_{id}.json
+      dados/{root_parent}/geracao/{root_parent}_{geracao}_{id}.json
 
     Retorna o nome do indivíduo (para train_networks/build_engine).
     """
     parent_folder, parent_json, parent_sanit = build_paths(parent_name)
-    gen_dir = _ensure_gen_dir(parent_folder)
+    # Pasta de geração deve sempre ficar em dados/{root_parent}/geracao
+    gen_dir = _ensure_gen_dir(parent_name)
 
     if not parent_json.exists():
         raise FileNotFoundError(f"Manifesto do parent não encontrado: {parent_json}")
@@ -245,30 +149,40 @@ def create_generation_individual(
     if not isinstance(parent_data, dict):
         raise ValueError(f"Manifesto do parent inválido (não é dict): {parent_json}")
 
-    child_name = f"{parent_sanit}_{int(generation_index)}_{int(individual_id)}"
+    # IMPORTANTÍSSIMO:
+    # Nome do novo indivíduo deve SEMPRE partir do root_parent (gen_dir.parent.name),
+    # para não gerar cadeias aninhadas do tipo Pos_Neg_1_2_2_0.
+    root_parent = gen_dir.parent.name
+    child_name = f"{root_parent}_{int(generation_index)}_{int(individual_id)}"
     child_data = copy.deepcopy(parent_data)
 
     ident = child_data.get("identification") or {}
     if not isinstance(ident, dict):
         ident = {}
-    ident["parent"] = parent_sanit
+    ident["name"] = child_name
+    ident["parent"] = parent_sanit  # mantém rastreio do parent real
     ident["generation"] = int(generation_index)
     ident["individual_id"] = int(individual_id)
-
-    # Mantém compatibilidade: o projeto costuma guardar o nome como "arquivo"
-    ident["name"] = f"{child_name}.json"
     child_data["identification"] = ident
 
-    child_data = mutate_manifest(child_data, cfg)
+    struct = child_data.get("structure") or {}
+    if not isinstance(struct, dict):
+        struct = {}
 
-    stats = child_data.get("stats") or {}
-    if not isinstance(stats, dict):
-        stats = {}
-    stats.setdefault("accuracy", None)
-    stats.setdefault("loss", None)
-    stats.setdefault("last_train_time", None)
-    child_data["stats"] = stats
+    hidden, out_size = _extract_structure_neurons(struct)
 
+    mutated_hidden = _mutate_hidden_layers(hidden, cfg)
+
+    # Remonta neurons preservando saída fixa se detectada
+    if out_size is not None:
+        struct["neurons"] = list(mutated_hidden) + [int(out_size)]
+    else:
+        # fallback: se não detectou saída, mantém o que tiver ou coloca mutated_hidden
+        struct["neurons"] = list(mutated_hidden) if mutated_hidden else struct.get("neurons", [])
+
+    child_data["structure"] = struct
+
+    # Salva JSON do indivíduo
     child_json = gen_dir / f"{child_name}.json"
     save_json(child_json, child_data)
 
@@ -286,27 +200,14 @@ def create_generation_individual(
 
 
 def rank_top_k(results: List[Dict[str, Any]], k: int = 3) -> List[Dict[str, Any]]:
-    """
-    Ordena resultados por:
-      - accuracy/acc desc
-      - loss/final_loss/loss_final asc
-
-    Aceita chaves alternativas para manter compatibilidade entre versões.
-    """
-    kk = max(1, int(k))
-
-    def _get_float(d: Dict[str, Any], keys: List[str], default: float) -> float:
-        for key in keys:
-            if key in d and d[key] is not None:
-                try:
-                    return float(d[key])
-                except Exception:
-                    pass
-        return float(default)
-
-    def key(r: Dict[str, Any]) -> Tuple[float, float]:
-        acc = _get_float(r, ["accuracy", "acc"], default=-1.0)
-        loss = _get_float(r, ["loss", "final_loss", "loss_final", "avg_loss", "loss_avg"], default=1e18)
+    """Rank simples: prioriza maior acc e menor loss."""
+    if not results:
+        return []
+    k = max(1, int(k))
+    def _key(r: Dict[str, Any]) -> Tuple[float, float]:
+        acc = float(r.get("acc", 0.0) or 0.0)
+        loss = float(r.get("loss", 1e18) or 1e18)
+        # sort: acc desc, loss asc
         return (-acc, loss)
-
-    return sorted(results, key=key)[:kk]
+    ranked = sorted(results, key=_key)
+    return ranked[:k]
