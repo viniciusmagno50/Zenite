@@ -1,14 +1,13 @@
 # ia_training.py
 # -----------------------------------------------------------
-# Funções de treinamento, avaliação  e (no futuro) mutação de redes,
-# integradas com:
-#   - IAManifest (estrutura de JSON moderna)
+# Funções de treinamento e avaliação integradas com:
+#   - IAManifest (estrutura JSON)
 #
-# Requisitos:
-#   - Para TREINO com backprop, é necessário PyTorch.
-#   - Se PyTorch não estiver disponível:
-#       * inferência/avaliação continua funcionando via forward em Python
-#       * treino NÃO deve derrubar o app: vira "no-op" com aviso (contrato ZeniteV3)
+# Correção crítica:
+#   - Normaliza manifesto conforme shape do dataset antes do treino/avaliação:
+#       * input_size = len(x)
+#       * output_size = n_classes (max(y)+1)
+#       * neurons e weights redimensionados de forma segura (pad/truncate)
 # -----------------------------------------------------------
 
 from __future__ import annotations
@@ -22,19 +21,17 @@ import random
 import time
 
 from json_lib import build_paths, load_json, save_json
-from ia_manifest import IAManifest, Structure  # noqa: F401  (Structure pode ser útil depois)
+from ia_manifest import IAManifest, Structure  # noqa: F401
 
 # -----------------------------------------------------------
 # Tentativa de importar PyTorch (opcional)
 # -----------------------------------------------------------
-try:  # pragma: no cover - depende do ambiente real
+try:  # pragma: no cover
     import torch  # type: ignore[attr-defined]
     import torch.nn as nn  # type: ignore[attr-defined]
-    import torch.nn.functional as F  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
-    F = None  # type: ignore[assignment]
 
 _TORCH_AVAILABLE: bool = torch is not None  # type: ignore[truthy-function]
 
@@ -45,10 +42,8 @@ else:
 
 
 if _TORCH_AVAILABLE:
-    # Ajustes simples de performance (não alteram a API)
     try:
         torch.backends.cudnn.benchmark = True  # type: ignore[union-attr]
-        # TF32 pode acelerar em GPUs recentes (sem quebrar em GPUs antigas)
         if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
             if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
                 torch.backends.cuda.matmul.allow_tf32 = True
@@ -56,6 +51,7 @@ if _TORCH_AVAILABLE:
             torch.backends.cudnn.allow_tf32 = True
     except Exception:
         pass
+
 
 # Cada amostra é (lista_de_entradas, classe_inteira)
 Sample = Tuple[Sequence[float], int]
@@ -65,15 +61,6 @@ Sample = Tuple[Sequence[float], int]
 # Utilitários de carga / salvamento de manifestos
 # -----------------------------------------------------------
 def load_manifest_by_name(name: str) -> Tuple[IAManifest, Path]:
-    """
-    Carrega um IAManifest a partir do 'name' (sem ou com .json),
-    usando a mesma convenção de pastas de json_lib.build_paths:
-
-      dados/{nome_sanitizado}/{nome_sanitizado}.json
-
-    Retorna:
-      (manifest, caminho_arquivo_json)
-    """
     pasta, arquivo, nome_sanit = build_paths(name)
     if not arquivo.exists():
         raise FileNotFoundError(
@@ -87,27 +74,225 @@ def load_manifest_by_name(name: str) -> Tuple[IAManifest, Path]:
 
 
 def save_manifest_to_path(manifest: IAManifest, path: Path) -> None:
-    """
-    Salva o IAManifest em um caminho específico.
-    """
     payload = manifest.to_dict()
     save_json(path, payload)
 
 
 # -----------------------------------------------------------
-# Rede "JsonNetwork"
-#   - se PyTorch estiver disponível: nn.Module real
-#   - se NÃO estiver: stub que só levanta erro ao tentar usar
+# Helpers: inferência de shape do dataset
+# -----------------------------------------------------------
+def _infer_input_len(data_list: List[Sample]) -> int:
+    if not data_list:
+        return 0
+    x0 = data_list[0][0]
+    try:
+        return max(1, int(len(x0)))
+    except Exception:
+        return 1
+
+
+def _infer_num_classes(data_list: List[Sample]) -> int:
+    if not data_list:
+        return 1
+    mx = 0
+    for _, y in data_list:
+        try:
+            mx = max(mx, int(y))
+        except Exception:
+            pass
+    return max(1, mx + 1)
+
+
+def _fix_input_vector(x_vals: Sequence[float], target_len: int) -> List[float]:
+    """
+    Garante que cada entrada tenha exatamente target_len:
+    - se menor, pad com 0.0
+    - se maior, trunca
+    """
+    try:
+        x = [float(v) for v in x_vals]
+    except Exception:
+        x = [0.0] * target_len
+
+    if len(x) < target_len:
+        x += [0.0] * (target_len - len(x))
+    elif len(x) > target_len:
+        x = x[:target_len]
+    return x
+
+
+# -----------------------------------------------------------
+# Normalização do manifesto conforme dataset (CORREÇÃO DO ERRO)
+# -----------------------------------------------------------
+def _parse_neurons(neurons_raw: Any) -> List[int]:
+    if isinstance(neurons_raw, str):
+        parts = [p.strip() for p in neurons_raw.split(",") if p.strip()]
+        out: List[int] = []
+        for p in parts:
+            try:
+                out.append(int(p))
+            except Exception:
+                pass
+        return out
+    if isinstance(neurons_raw, (int, float)):
+        return [int(neurons_raw)]
+    if isinstance(neurons_raw, list):
+        out = []
+        for v in neurons_raw:
+            try:
+                out.append(int(v))
+            except Exception:
+                pass
+        return out
+    return []
+
+
+def _resize_weights_like(input_size: int, neurons: List[int], old_weights: Any) -> List[List[List[float]]]:
+    """
+    Ajusta weights para bater com input_size e neurons, preservando o máximo possível.
+    Formato por camada:
+      layer -> lista de neurônios
+      neuron -> [bias, w1..wN]
+    """
+    if input_size <= 0:
+        input_size = 1
+
+    if not isinstance(old_weights, list):
+        old_weights = []
+
+    new_weights: List[List[List[float]]] = []
+    prev_in = int(input_size)
+
+    for li, n_out in enumerate(neurons):
+        n_out = max(1, int(n_out))
+        old_layer = old_weights[li] if li < len(old_weights) and isinstance(old_weights[li], list) else []
+        layer_rows: List[List[float]] = []
+
+        for ni in range(n_out):
+            if ni < len(old_layer) and isinstance(old_layer[ni], list) and len(old_layer[ni]) >= 1:
+                row = old_layer[ni]
+                try:
+                    bias = float(row[0])
+                except Exception:
+                    bias = 0.0
+
+                w_raw = row[1:] if len(row) > 1 else []
+                w: List[float] = []
+                for x in w_raw:
+                    try:
+                        w.append(float(x))
+                    except Exception:
+                        w.append(0.0)
+            else:
+                bias = random.uniform(-0.05, 0.05)
+                w = [random.uniform(-0.05, 0.05) for _ in range(prev_in)]
+
+            if len(w) < prev_in:
+                w += [random.uniform(-0.05, 0.05) for _ in range(prev_in - len(w))]
+            elif len(w) > prev_in:
+                w = w[:prev_in]
+
+            layer_rows.append([bias] + w)
+
+        new_weights.append(layer_rows)
+        prev_in = n_out
+
+    return new_weights
+
+
+def _normalize_manifest_for_data(manifest: IAManifest, input_len: int, n_classes: int) -> bool:
+    """
+    Garante que manifest.structure esteja coerente com o dataset:
+      - input_size == input_len
+      - output_size == n_classes
+      - neurons[-1] == n_classes
+      - weights redimensionados conforme input/neurons
+      - activation ajustado para o nº de camadas
+    Retorna True se alterou algo.
+    """
+    changed = False
+    st = manifest.structure
+
+    # input/output sizes
+    if getattr(st, "input_size", None) != int(input_len):
+        st.input_size = int(input_len)
+        changed = True
+
+    if getattr(st, "output_size", None) != int(n_classes):
+        st.output_size = int(n_classes)
+        changed = True
+
+    neurons = _parse_neurons(getattr(st, "neurons", None))
+    if not neurons:
+        # cria uma estrutura mínima: hidden default + output
+        neurons = [max(2, input_len), int(n_classes)]
+        changed = True
+    else:
+        # garante saída compatível
+        if neurons[-1] != int(n_classes):
+            neurons[-1] = int(n_classes)
+            changed = True
+
+    neurons = [max(1, int(x)) for x in neurons]
+    if getattr(st, "neurons", None) != neurons:
+        st.neurons = neurons
+        changed = True
+
+    # layers
+    if getattr(st, "layers", None) != len(neurons):
+        st.layers = len(neurons)
+        changed = True
+
+    # weights
+    old_weights = getattr(st, "weights", None)
+    new_weights = _resize_weights_like(int(input_len), neurons, old_weights)
+    if old_weights != new_weights:
+        st.weights = new_weights
+        changed = True
+
+    # activation
+    act = getattr(st, "activation", None)
+    if act is None:
+        activation: List[Optional[str]] = [None] * len(neurons)
+        st.activation = activation
+        changed = True
+    else:
+        if isinstance(act, str):
+            activation = [act] * len(neurons)
+            st.activation = activation
+            changed = True
+        elif isinstance(act, list):
+            activation2: List[Optional[str]] = []
+            for a in act:
+                if a is None or isinstance(a, str):
+                    activation2.append(a)
+                else:
+                    activation2.append(None)
+            if len(activation2) < len(neurons):
+                activation2 += [None] * (len(neurons) - len(activation2))
+                changed = True
+            elif len(activation2) > len(neurons):
+                activation2 = activation2[: len(neurons)]
+                changed = True
+            if activation2 != act:
+                st.activation = activation2
+                changed = True
+        else:
+            st.activation = [None] * len(neurons)
+            changed = True
+
+    return changed
+
+
+# -----------------------------------------------------------
+# Rede JsonNetwork (PyTorch)
 # -----------------------------------------------------------
 if _TORCH_AVAILABLE:
 
     class JsonNetwork(nn.Module):  # type: ignore[misc]
         """
         Constrói uma rede neural em PyTorch a partir de um IAManifest.
-
-        Convenções:
-          - structure.weights = [camada][neurônio][bias, w1..wN]
-          - structure.activation = ["tanh", None, ...] alinhado com 'neurons'
+        weights = [camada][neurônio][bias, w1..wN]
         """
 
         def __init__(self, manifest: IAManifest):
@@ -118,6 +303,7 @@ if _TORCH_AVAILABLE:
 
             weights_all = st.weights or []
             activ_all = list(st.activation or [])
+
             if len(activ_all) < len(weights_all):
                 activ_all += [None] * (len(weights_all) - len(activ_all))
             elif len(activ_all) > len(weights_all):
@@ -131,10 +317,12 @@ if _TORCH_AVAILABLE:
                     raise ValueError(f"Camada {i} do manifesto está vazia.")
 
                 out_features = len(layer)
-                in_features = len(layer[0]) - 1  # exclui bias
+                # in_features vem do tamanho do neurônio (bias + w...)
+                in_features = len(layer[0]) - 1
+                in_features = max(1, int(in_features))
 
                 linear = nn.Linear(in_features, out_features)
-                # Preenche pesos/bias com os valores do JSON
+
                 w_rows: List[List[float]] = []
                 b_vals: List[float] = []
                 for n in layer:
@@ -158,10 +346,8 @@ if _TORCH_AVAILABLE:
                     x = torch.tanh(x)
                 elif act == "relu":
                     x = torch.relu(x)
-                # None => saída linear
             return x
 
-        # Exporta pesos atuais de volta para o formato do manifesto
         def export_weights(self) -> List[List[List[float]]]:
             new_weights: List[List[List[float]]] = []
             for linear in self.layers:
@@ -177,14 +363,7 @@ if _TORCH_AVAILABLE:
 
 else:
 
-    class JsonNetwork:  # pragma: no cover - usado só quando torch não existe
-        """
-        Stub de JsonNetwork para ambientes SEM PyTorch.
-
-        Serve apenas para evitar erros de import. Qualquer tentativa
-        de instanciar/usar vai levantar RuntimeError.
-        """
-
+    class JsonNetwork:  # pragma: no cover
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             raise RuntimeError(
                 "PyTorch não está disponível; JsonNetwork não pode ser instanciada.\n"
@@ -192,13 +371,11 @@ else:
             )
 
         def export_weights(self) -> List[List[List[float]]]:
-            raise RuntimeError(
-                "PyTorch não está disponível; JsonNetwork não pode exportar pesos."
-            )
+            raise RuntimeError("PyTorch não está disponível; JsonNetwork não pode exportar pesos.")
 
 
 # -----------------------------------------------------------
-# Estrutura de retorno de treino / avaliação
+# Estrutura de retorno
 # -----------------------------------------------------------
 @dataclass
 class TrainResult:
@@ -219,25 +396,8 @@ class EvalResult:
 
 
 # -----------------------------------------------------------
-# Função de TREINO (uma ou várias redes)
+# Loss utils (modo python)
 # -----------------------------------------------------------
-ProgressCallback = Callable[
-    [str, int, int, int, int, float],
-    bool,
-]
-# args:
-#   name          -> nome da rede
-#   step          -> passo global (1..total_steps)
-#   total_steps   -> total de passos (samples * epochs)
-#   epoch         -> época atual (1..n_epochs)
-#   total_epochs  -> total de épocas
-#   loss          -> loss do passo atual
-#
-# retorno:
-#   True  -> continuar
-#   False -> interromper o treinamento daquela rede
-
-
 def _softmax_stable(logits: Sequence[float]) -> List[float]:
     if not logits:
         return []
@@ -250,9 +410,6 @@ def _softmax_stable(logits: Sequence[float]) -> List[float]:
 
 
 def _cross_entropy_from_logits(logits: Sequence[float], y_true: int) -> float:
-    """
-    Loss cross-entropy (NLL) a partir de logits (saída linear do forward python).
-    """
     probs = _softmax_stable(logits)
     if not probs:
         return float("nan")
@@ -260,6 +417,37 @@ def _cross_entropy_from_logits(logits: Sequence[float], y_true: int) -> float:
         return float("nan")
     p = max(1e-12, float(probs[y_true]))
     return -math.log(p)
+
+
+def _forward_python(
+    weights: List[List[List[float]]],
+    activation: List[Optional[str]],
+    inputs: Sequence[float],
+) -> List[float]:
+    x = list(inputs)
+    for layer_idx, layer in enumerate(weights):
+        next_x: List[float] = []
+        act = (activation[layer_idx] or "").lower() if layer_idx < len(activation) else ""
+        for neuron in layer:
+            bias = float(neuron[0])
+            w = neuron[1:]
+            s = bias
+            for j, wj in enumerate(w):
+                if j < len(x):
+                    s += float(wj) * float(x[j])
+            if act == "tanh":
+                s = math.tanh(s)
+            elif act == "relu":
+                s = max(0.0, s)
+            next_x.append(s)
+        x = next_x
+    return x
+
+
+# -----------------------------------------------------------
+# Treino
+# -----------------------------------------------------------
+ProgressCallback = Callable[[str, int, int, int, int, float], bool]
 
 
 def train_networks(
@@ -272,31 +460,18 @@ def train_networks(
     batch_size: int = 1,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, TrainResult]:
-    """
-    Treina uma ou mais redes (por nome) em cima de uma lista de amostras:
-
-        data = [(entrada, classe_alvo), ...]
-
-    A arquitetura/pesos iniciais são lidos do JSON (IAManifest).
-    Ao final, os pesos treinados são gravados de volta no JSON.
-
-    Se progress_callback for fornecido, será chamado durante o treino (por batch)
-    com informações de progresso e pode retornar False para interromper
-    o treinamento da rede atual.
-
-    IMPORTANTE (contrato ZeniteV3):
-      - Sem PyTorch: não derruba o app.
-        O treino vira "no-op" (sem atualizar pesos), mas retorna métricas/loss
-        calculadas via forward Python para manter UI funcional.
-    """
     if not data:
         raise ValueError("Lista de dados de treino está vazia.")
 
     data_list: List[Sample] = list(data)
+
+    input_len = _infer_input_len(data_list)
+    n_classes = _infer_num_classes(data_list)
+
     results: Dict[str, TrainResult] = {}
 
     # ------------------------------
-    # Modo sem PyTorch: no-op training
+    # Modo sem PyTorch: no-op training (não derruba o app)
     # ------------------------------
     if not _TORCH_AVAILABLE:
         if verbose:
@@ -312,6 +487,15 @@ def train_networks(
 
         for name in network_names:
             manifest, path_json = load_manifest_by_name(name)
+
+            # NORMALIZA MANIFESTO PARA BATER COM DATA
+            changed = _normalize_manifest_for_data(manifest, input_len=input_len, n_classes=n_classes)
+            if changed:
+                # salva já corrigido para eliminar o erro no próximo treino
+                save_manifest_to_path(manifest, path_json)
+                if verbose:
+                    print(f"[TRAIN] Manifest '{name}' normalizado (input={input_len}, classes={n_classes}).")
+
             st = manifest.structure
             weights = st.weights or []
             activation = list(st.activation or [])
@@ -329,14 +513,13 @@ def train_networks(
                 for pos in range(0, len(indices), bs):
                     batch_idx = indices[pos : pos + bs]
 
-                    # "no-op": apenas calcula loss média do batch
                     batch_losses: List[float] = []
                     for idx in batch_idx:
                         x_vals, y_true = data_list[idx]
-                        logits = _forward_python(weights, activation, x_vals)
+                        x_fix = _fix_input_vector(x_vals, input_len)
+                        logits = _forward_python(weights, activation, x_fix)
                         batch_losses.append(_cross_entropy_from_logits(logits, int(y_true)))
 
-                    # loss do passo (batch) como média
                     loss_val = float(sum(batch_losses) / max(1, len(batch_losses)))
                     losses_all.append(loss_val)
 
@@ -357,36 +540,17 @@ def train_networks(
 
                 if stop_requested:
                     if verbose:
-                        print(
-                            f"[TRAIN] No-op treino de '{name}' interrompido pelo usuário "
-                            f"na época {epoch + 1}."
-                        )
+                        print(f"[TRAIN] No-op treino de '{name}' interrompido na época {epoch + 1}.")
                     break
 
             elapsed = time.perf_counter() - t0
-            if losses_all:
-                final_loss = float(losses_all[-1])
-                avg_loss = float(sum(losses_all) / float(len(losses_all)))
-            else:
-                final_loss = math.nan
-                avg_loss = math.nan
-
-            # Não altera pesos (no-op). Salva manifesto opcionalmente? Aqui NÃO precisa.
-            # Mantemos o arquivo intacto para evitar falsa impressão de "treinou".
-
-            if verbose:
-                print(
-                    f"[TRAIN] (no-op) '{name}': "
-                    f"samples={total_samples}, req_epochs={int(n_epochs)}, "
-                    f"steps={step_counter}/{total_steps}, "
-                    f"final_loss={final_loss:.6g}, avg_loss={avg_loss:.6g}, "
-                    f"time={elapsed:.2f}s"
-                )
+            final_loss = float(losses_all[-1]) if losses_all else math.nan
+            avg_loss = float(sum(losses_all) / float(len(losses_all))) if losses_all else math.nan
 
             results[name] = TrainResult(
                 name=name,
                 samples=total_samples,
-                epochs=0,  # <- indica que NÃO houve backprop
+                epochs=0,  # no-op
                 final_loss=final_loss,
                 avg_loss=avg_loss,
                 elapsed_seconds=float(elapsed),
@@ -397,10 +561,16 @@ def train_networks(
     # ------------------------------
     # Modo com PyTorch: treino real
     # ------------------------------
-    results = {}
-
     for name in network_names:
         manifest, path_json = load_manifest_by_name(name)
+
+        # NORMALIZA MANIFESTO PARA BATER COM DATA (fix do erro matmul)
+        changed = _normalize_manifest_for_data(manifest, input_len=input_len, n_classes=n_classes)
+        if changed:
+            save_manifest_to_path(manifest, path_json)
+            if verbose:
+                print(f"[TRAIN] Manifest '{name}' normalizado (input={input_len}, classes={n_classes}).")
+
         model = JsonNetwork(manifest).to(_DEVICE)  # type: ignore[arg-type]
         model.train()
 
@@ -415,27 +585,25 @@ def train_networks(
         t0 = time.perf_counter()
         stop_requested = False
 
+        bs = max(1, int(batch_size))
+
         for epoch in range(int(n_epochs)):
             indices = list(range(total_samples))
             if shuffle:
                 random.shuffle(indices)
 
-            for pos in range(0, len(indices), max(1, int(batch_size))):
-                batch_idx = indices[pos : pos + max(1, int(batch_size))]
+            for pos in range(0, len(indices), bs):
+                batch_idx = indices[pos : pos + bs]
 
-                xs = []
-                ys = []
+                xs: List[List[float]] = []
+                ys: List[int] = []
                 for idx in batch_idx:
                     x_vals, target_cls = data_list[idx]
-                    xs.append(x_vals)
+                    xs.append(_fix_input_vector(x_vals, input_len))
                     ys.append(int(target_cls))
 
-                x_tensor = torch.tensor(  # type: ignore[union-attr]
-                    xs, dtype=torch.float32, device=_DEVICE
-                )
-                y_tensor = torch.tensor(  # type: ignore[union-attr]
-                    ys, dtype=torch.long, device=_DEVICE
-                )
+                x_tensor = torch.tensor(xs, dtype=torch.float32, device=_DEVICE)  # type: ignore[union-attr]
+                y_tensor = torch.tensor(ys, dtype=torch.long, device=_DEVICE)  # type: ignore[union-attr]
 
                 optimizer.zero_grad()
                 logits = model(x_tensor)
@@ -463,35 +631,16 @@ def train_networks(
 
             if stop_requested:
                 if verbose:
-                    print(
-                        f"[TRAIN] Treinamento de '{name}' interrompido pelo usuário "
-                        f"na época {epoch + 1}."
-                    )
+                    print(f"[TRAIN] Treinamento de '{name}' interrompido na época {epoch + 1}.")
                 break
 
         elapsed = time.perf_counter() - t0
+        final_loss = float(losses_all[-1]) if losses_all else math.nan
+        avg_loss = float(sum(losses_all) / float(len(losses_all))) if losses_all else math.nan
 
-        if losses_all:
-            final_loss = float(losses_all[-1])
-            avg_loss = float(sum(losses_all) / float(len(losses_all)))
-        else:
-            final_loss = math.nan
-            avg_loss = math.nan
-
-        # Atualiza pesos no manifesto e salva
         new_weights = model.export_weights()
         manifest.structure.weights = new_weights
         save_manifest_to_path(manifest, path_json)
-
-        total_used_steps = step_counter
-        if verbose:
-            print(
-                f"[TRAIN] '{name}': "
-                f"samples={total_samples}, epochs={int(n_epochs)}, "
-                f"steps={total_used_steps}/{total_steps}, "
-                f"final_loss={final_loss:.6g}, avg_loss={avg_loss:.6g}, "
-                f"time={elapsed:.2f}s"
-            )
 
         results[name] = TrainResult(
             name=name,
@@ -506,38 +655,7 @@ def train_networks(
 
 
 # -----------------------------------------------------------
-# Forward em Python puro (sem PyTorch)
-# -----------------------------------------------------------
-def _forward_python(
-    weights: List[List[List[float]]],
-    activation: List[Optional[str]],
-    inputs: Sequence[float],
-) -> List[float]:
-    """
-    Forward pass simples em Python puro, usado quando PyTorch não está disponível.
-    """
-    x = list(inputs)
-    for layer_idx, layer in enumerate(weights):
-        next_x: List[float] = []
-        act = (activation[layer_idx] or "").lower() if layer_idx < len(activation) else ""
-        for neuron in layer:
-            bias = float(neuron[0])
-            w = neuron[1:]
-            s = bias
-            for j, wj in enumerate(w):
-                if j < len(x):
-                    s += float(wj) * float(x[j])
-            if act == "tanh":
-                s = math.tanh(s)
-            elif act == "relu":
-                s = max(0.0, s)
-            next_x.append(s)
-        x = next_x
-    return x
-
-
-# -----------------------------------------------------------
-# Função de AVALIAÇÃO (uma ou várias redes)
+# Avaliação
 # -----------------------------------------------------------
 def evaluate_networks(
     network_names: Sequence[str],
@@ -545,14 +663,6 @@ def evaluate_networks(
     limit: Optional[int] = None,
     verbose: bool = True,
 ) -> List[EvalResult]:
-    """
-    Avalia uma ou mais redes em cima de uma lista de amostras (entrada, classe).
-
-    Retorna lista de EvalResult ordenada por:
-      - maior accuracy
-      - menor tempo médio por amostra
-      - menor loss médio (se disponível)
-    """
     data_list: List[Sample] = list(data)
     if not data_list:
         raise ValueError("Lista de dados para avaliação está vazia.")
@@ -560,11 +670,22 @@ def evaluate_networks(
     if limit is not None and limit > 0 and limit < len(data_list):
         data_list = random.sample(data_list, limit)
 
+    input_len = _infer_input_len(data_list)
+    n_classes = _infer_num_classes(data_list)
+
     total_data = len(data_list)
     results: List[EvalResult] = []
 
     for name in network_names:
-        manifest, _ = load_manifest_by_name(name)
+        manifest, path_json = load_manifest_by_name(name)
+
+        # NORMALIZA também na avaliação (evita crash por mismatch)
+        changed = _normalize_manifest_for_data(manifest, input_len=input_len, n_classes=n_classes)
+        if changed:
+            save_manifest_to_path(manifest, path_json)
+            if verbose:
+                print(f"[EVAL] Manifest '{name}' normalizado (input={input_len}, classes={n_classes}).")
+
         st = manifest.structure
         weights = st.weights or []
         activation = list(st.activation or [])
@@ -585,34 +706,22 @@ def evaluate_networks(
 
         for x_vals, target_cls in data_list:
             y_true = int(target_cls)
+            x_fix = _fix_input_vector(x_vals, input_len)
 
             if use_torch:
                 with torch.no_grad():  # type: ignore[union-attr]
-                    x_tensor = torch.tensor(  # type: ignore[union-attr]
-                        x_vals, dtype=torch.float32, device=_DEVICE
-                    ).unsqueeze(0)
+                    x_tensor = torch.tensor(x_fix, dtype=torch.float32, device=_DEVICE).unsqueeze(0)  # type: ignore[union-attr]
                     logits = model(x_tensor)  # type: ignore[operator]
-                    probs = torch.nn.functional.softmax(logits, dim=-1)  # type: ignore[union-attr]
-                    pred_cls = int(torch.argmax(probs, dim=-1).item())  # type: ignore[union-attr]
+                    pred_cls = int(torch.argmax(logits, dim=-1).item())  # type: ignore[union-attr]
                     if criterion is not None:
                         loss = criterion(
                             logits,
-                            torch.tensor(  # type: ignore[union-attr]
-                                [y_true], dtype=torch.long, device=_DEVICE
-                            ),
+                            torch.tensor([y_true], dtype=torch.long, device=_DEVICE),  # type: ignore[union-attr]
                         )
                         losses.append(float(loss.item()))
             else:
-                out = _forward_python(weights, activation, x_vals)
-                max_idx = 0
-                max_val = float("-inf")
-                for i, v in enumerate(out):
-                    if v > max_val:
-                        max_val = v
-                        max_idx = i
-                pred_cls = max_idx
-
-                # loss opcional no modo python (mantém avg_loss mais útil)
+                out = _forward_python(weights, activation, x_fix)
+                pred_cls = int(max(range(len(out)), key=lambda i: out[i])) if out else 0
                 ce = _cross_entropy_from_logits(out, y_true)
                 if not math.isnan(ce):
                     losses.append(float(ce))
@@ -625,14 +734,6 @@ def evaluate_networks(
         avg_loss = float(sum(losses) / float(len(losses))) if losses else None
         avg_time_per_sample = elapsed / float(total_data)
 
-        if verbose:
-            print(
-                f"[EVAL] '{name}': "
-                f"accuracy={accuracy:.4f}, "
-                f"avg_loss={avg_loss if avg_loss is not None else 'N/A'}, "
-                f"time/sample={avg_time_per_sample*1000:.3f} ms"
-            )
-
         results.append(
             EvalResult(
                 name=name,
@@ -642,9 +743,5 @@ def evaluate_networks(
             )
         )
 
-    def _sort_key(r: EvalResult):
-        loss_key = r.avg_loss if r.avg_loss is not None else float("inf")
-        return (-r.accuracy, r.avg_time_per_sample, loss_key)
-
-    results.sort(key=_sort_key)
+    results.sort(key=lambda r: (-r.accuracy, r.avg_time_per_sample, r.avg_loss if r.avg_loss is not None else float("inf")))
     return results

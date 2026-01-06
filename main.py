@@ -23,7 +23,8 @@ class MainWindow(QMainWindow):
         self.cfg = cfg
 
         self.setWindowTitle("DataAnalise")
-        self.setMinimumSize(1200, 720)
+        self.setMinimumSize(1720, 920)
+        self.showMaximized()
 
         # Split principal: esquerda (menu) / direita (conteúdo)
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
