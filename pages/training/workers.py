@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import math
+import inspect
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QObject, Signal
@@ -29,27 +30,83 @@ class EpochMetrics:
     samples_per_sec: float
     learning_rate: float
 
-    class_counts: List[int]      # contagem de predições por classe (pred)
-    class_hits: List[int]        # contagem de acertos por classe verdadeira (y_true)
+    class_counts: List[int]
+    class_hits: List[int]
 
-    out_min: float               # min confiança (softmax) nos acertos
-    out_max: float               # max confiança (softmax) nos acertos
-    conf_hist_100: List[int]     # histograma 100 bins (0..1) nos acertos
+    out_min: float
+    out_max: float
+    conf_hist_100: List[int]
+
+
+# -----------------------------------------------------------------------------
+# Helpers numéricos
+# -----------------------------------------------------------------------------
+def _is_finite(x: Any) -> bool:
+    try:
+        return math.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _prob_to_bin_100(p: float) -> Optional[int]:
+    """
+    Converte probabilidade [0..1] para bin [0..99].
+    Retorna None se p for NaN/inf.
+    """
+    if not _is_finite(p):
+        return None
+    if p < 0.0:
+        p = 0.0
+    elif p > 1.0:
+        p = 1.0
+    b = int(p * 100.0)
+    if b >= 100:
+        b = 99
+    elif b < 0:
+        b = 0
+    return b
 
 
 # -----------------------------------------------------------------------------
 # Utilidades locais
 # -----------------------------------------------------------------------------
 def _softmax(logits: Sequence[float]) -> List[float]:
+    """
+    Softmax defensivo:
+      - Se logits contiver NaN/inf -> retorna [] (amostra é ignorada)
+      - Se exp/soma der NaN/inf -> retorna []
+    """
     if not logits:
         return []
+
+    for x in logits:
+        if not _is_finite(x):
+            return []
+
     m = max(float(x) for x in logits)
-    exps = [math.exp(float(x) - m) for x in logits]
+    exps: List[float] = []
+    for x in logits:
+        e = math.exp(float(x) - m)
+        if not math.isfinite(e):
+            return []
+        exps.append(e)
+
     s = sum(exps)
-    if s <= 0.0:
-        n = len(exps)
-        return [1.0 / n] * n if n > 0 else []
-    return [e / s for e in exps]
+    if not math.isfinite(s) or s <= 0.0:
+        return []
+
+    probs = [e / s for e in exps]
+    if any((not math.isfinite(p)) for p in probs):
+        return []
+    return probs
 
 
 def _forward_python(
@@ -121,24 +178,15 @@ def _ensure_len(arr: List[int], n: int) -> None:
 
 
 def _sample_to_xy(sample: Any) -> Tuple[Optional[Sequence[float]], Optional[Any]]:
-    """
-    Suporta:
-      - Sample = (x_vals, y_int)  [seu formato real no ia_training.py]
-      - objetos com atributos .x e .y
-      - objetos com chaves ['x'], ['y']
-    """
-    # formato principal do projeto: tuple/list (x, y)
     if isinstance(sample, (tuple, list)) and len(sample) >= 2:
         return sample[0], sample[1]
 
-    # formato futuro: objeto .x/.y
     if hasattr(sample, "x") and hasattr(sample, "y"):
         try:
             return getattr(sample, "x"), getattr(sample, "y")
         except Exception:
             return None, None
 
-    # fallback dict
     if isinstance(sample, dict):
         return sample.get("x"), sample.get("y")
 
@@ -146,12 +194,6 @@ def _sample_to_xy(sample: Any) -> Tuple[Optional[Sequence[float]], Optional[Any]
 
 
 def _y_to_class(y: Any) -> Optional[int]:
-    """
-    Aceita:
-      - int / float
-      - list/tuple one-hot/prob
-      - numpy array (via list())
-    """
     if y is None:
         return None
     if isinstance(y, bool):
@@ -159,21 +201,29 @@ def _y_to_class(y: Any) -> Optional[int]:
     if isinstance(y, int):
         return int(y)
     if isinstance(y, float):
+        if not _is_finite(y):
+            return None
         return int(y)
 
     if isinstance(y, (list, tuple)):
         if not y:
             return None
         try:
-            return int(max(range(len(y)), key=lambda i: float(y[i])))
+            vals = [float(v) for v in y]
+            if any((not math.isfinite(v)) for v in vals):
+                return None
+            return int(max(range(len(vals)), key=lambda i: vals[i]))
         except Exception:
             return None
 
     try:
-        yy = list(y)  # numpy etc
+        yy = list(y)
         if not yy:
             return None
-        return int(max(range(len(yy)), key=lambda i: float(yy[i])))
+        vals = [float(v) for v in yy]
+        if any((not math.isfinite(v)) for v in vals):
+            return None
+        return int(max(range(len(vals)), key=lambda i: vals[i]))
     except Exception:
         return None
 
@@ -185,8 +235,7 @@ def _eval_details_softmax(
 ) -> Tuple[float, float, float, List[int], List[int], List[int]]:
     """
     Avalia via forward Python + softmax.
-    - Distribuição: conta TODAS as predições (mesmo errando)
-    - Hist/confiança min/max: conta APENAS quando acerta (conforme sua regra)
+    Defensivo: ignora amostras com NaN/inf em logits/probs.
     """
     data_list = list(data)
     if limit is not None and int(limit) > 0:
@@ -197,7 +246,6 @@ def _eval_details_softmax(
 
     weights, activation = _load_weights_activation_from_json(network_name)
 
-    # n_classes pelo tamanho da última camada
     n_classes = 0
     try:
         if weights and isinstance(weights[-1], list):
@@ -205,7 +253,6 @@ def _eval_details_softmax(
     except Exception:
         n_classes = 0
 
-    # fallback: pelo y max
     if n_classes <= 0:
         ys: List[int] = []
         for s in data_list:
@@ -243,7 +290,7 @@ def _eval_details_softmax(
         _ensure_len(class_hits, len(probs))
 
         pred = max(range(len(probs)), key=lambda i: probs[i])
-        class_counts[pred] += 1  # SEMPRE
+        class_counts[pred] += 1
 
         total += 1
         if pred == y_true:
@@ -252,15 +299,11 @@ def _eval_details_softmax(
                 class_hits[y_true] += 1
 
             p = float(probs[y_true]) if 0 <= y_true < len(probs) else 0.0
-            b = int(p * 100.0)
-            if b >= 100:
-                b = 99
-            elif b < 0:
-                b = 0
-            hist100[b] += 1
-
-            out_min = min(out_min, p)
-            out_max = max(out_max, p)
+            b = _prob_to_bin_100(p)
+            if b is not None:
+                hist100[b] += 1
+                out_min = min(out_min, p)
+                out_max = max(out_max, p)
 
     acc = (correct / float(total)) if total > 0 else 0.0
     if correct <= 0:
@@ -269,13 +312,40 @@ def _eval_details_softmax(
     return float(acc), float(out_min), float(out_max), list(class_counts), list(class_hits), list(hist100)
 
 
+def _call_build_engine_compat(name: str) -> Any:
+    """
+    Compatibilidade:
+      - build_engine(name)   (seu caso atual)
+      - build_engine()       (caso antigo)
+    """
+    try:
+        sig = inspect.signature(build_engine)
+        params = list(sig.parameters.values())
+        requires_name = False
+        for p in params:
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                if p.default is inspect._empty:
+                    requires_name = True
+                break
+        if requires_name:
+            return build_engine(name)
+        return build_engine()
+    except TypeError:
+        try:
+            return build_engine(name)
+        except Exception:
+            return build_engine()
+    except Exception:
+        return None
+
+
 # -----------------------------------------------------------------------------
 # Worker de treino (thread)
 # -----------------------------------------------------------------------------
 class TrainWorker(QObject):
     epoch_metrics = Signal(object)  # EpochMetrics
-    progress_epochs = Signal(int, int)  # epoch_atual, total_epocas
-    batch_progress = Signal(str, int, int, int, int, float)  # name, step_global, total_steps_global, epoch_index, total_epochs, loss
+    progress_epochs = Signal(int, int)
+    batch_progress = Signal(str, int, int, int, int, float)
 
     stopped = Signal()
     log = Signal(str)
@@ -294,7 +364,7 @@ class TrainWorker(QObject):
         eval_limit: Optional[int],
         shuffle: bool,
         progress_update_n: int = 1000,
-        output_index: int = 0,   # mantido por compatibilidade (não usado aqui)
+        output_index: int = 0,
         batch_size: int = 16,
     ):
         super().__init__()
@@ -331,6 +401,8 @@ class TrainWorker(QObject):
             if not self.train_data:
                 raise RuntimeError("Dataset de treino vazio.")
 
+            _call_build_engine_compat(self.network_name)
+
             lr = float(self.learning_rate)
             steps_per_epoch = max(1, len(self.train_data))
             total_steps_global = steps_per_epoch * self.epochs
@@ -357,6 +429,8 @@ class TrainWorker(QObject):
                     step_global = epoch_base + int(step_counter)
                     step_global = max(0, min(int(step_global), int(total_steps_global)))
 
+                    safe_loss = _safe_float(loss_val, default=0.0)
+
                     if int(step_counter) % self.progress_update_n == 0:
                         self.batch_progress.emit(
                             str(name),
@@ -364,7 +438,7 @@ class TrainWorker(QObject):
                             int(total_steps_global),
                             int(ep),
                             int(self.epochs),
-                            float(loss_val),
+                            float(safe_loss),
                         )
                     return True
 
@@ -388,8 +462,8 @@ class TrainWorker(QObject):
                     self.eval_limit,
                 )
 
-                loss_final = float(getattr(tr, "final_loss", 0.0) or 0.0)
-                loss_avg = float(getattr(tr, "avg_loss", loss_final) or loss_final)
+                loss_final = _safe_float(getattr(tr, "final_loss", 0.0), default=0.0)
+                loss_avg = _safe_float(getattr(tr, "avg_loss", loss_final), default=loss_final)
 
                 elapsed = max(1e-6, datetime.now().timestamp() - t0)
                 processed_steps = min(total_steps_global, (ep + 1) * steps_per_epoch)
@@ -429,7 +503,7 @@ class TrainWorker(QObject):
 # Worker de evolução/gerações (thread)
 # -----------------------------------------------------------------------------
 class GenerationalWorker(QObject):
-    finished = Signal(list)  # tops
+    finished = Signal(list)  # tops (lista de dicts)
     error = Signal(str)
     log = Signal(str)
     progress = Signal(str, int, int, float)  # name, step, total_steps, loss
@@ -449,11 +523,12 @@ class GenerationalWorker(QObject):
         population: int,
         mutation_cfg: MutationConfig,
         update_every_n: int = 1000,
-        output_index: int = 0,  # compat
+        output_index: int = 0,
         batch_size: int = 16,
+        evolve_best: bool = False,
     ):
         super().__init__()
-        self.parent_name = parent_name
+        self.parent_name = str(parent_name)
         self.train_data = list(train_data)
         self.epochs_per_individual = max(1, int(epochs_per_individual))
         self.learning_rate = float(learning_rate)
@@ -467,6 +542,7 @@ class GenerationalWorker(QObject):
         self.mutation_cfg = mutation_cfg
         self.update_every_n = max(1, int(update_every_n))
         self.batch_size = max(1, int(batch_size))
+        self.evolve_best = bool(evolve_best)
         self._stop = False
 
     def stop(self) -> None:
@@ -477,10 +553,11 @@ class GenerationalWorker(QObject):
             if not self.train_data:
                 raise RuntimeError("Dataset de treino vazio (gerações).")
 
-            _ = build_engine()
-            lr = float(self.learning_rate)
+            _call_build_engine_compat(self.parent_name)
 
-            tops: List[Dict[str, Any]] = []
+            lr = float(self.learning_rate)
+            current_parent = str(self.parent_name)
+
             step_counter = 0
             total_steps = (
                 self.generations
@@ -502,27 +579,32 @@ class GenerationalWorker(QObject):
                     return False
                 step_counter += 1
                 if step_counter % self.update_every_n == 0:
-                    self.progress.emit(str(name), step_counter, total_steps, float(loss_val))
+                    self.progress.emit(str(name), step_counter, total_steps, _safe_float(loss_val, 0.0))
                 return True
+
+            tops: List[Dict[str, Any]] = []
 
             for g in range(1, self.generations + 1):
                 if self._stop:
                     self.stopped.emit()
                     break
 
-                individuals: List[str] = []
+                self.log.emit(f"[GEN] Iniciando geração {g}/{self.generations}... parent={current_parent}")
+
+                results: List[Dict[str, Any]] = []
+
                 for i in range(self.population):
                     if self._stop:
                         break
+
                     ind_name = create_generation_individual(
-                        parent_name=self.parent_name,
-                        generation=g,
-                        idx=i,
+                        parent_name=current_parent,
+                        generation_index=g,
+                        individual_id=i,
                         cfg=self.mutation_cfg,
                     )
-                    individuals.append(ind_name)
 
-                    train_networks(
+                    train_map = train_networks(
                         network_names=[ind_name],
                         data=self.train_data,
                         learning_rate=lr,
@@ -532,16 +614,43 @@ class GenerationalWorker(QObject):
                         progress_callback=_progress_cb,
                         batch_size=self.batch_size,
                     )
+                    tr = train_map.get(ind_name)
+                    if tr is None:
+                        self.log.emit(f"[GEN] '{ind_name}': treino retornou vazio.")
+                        continue
 
-                ranked = rank_top_k(
-                    individuals=individuals,
-                    data=self.train_data,
-                    k=min(10, len(individuals)),
-                    eval_limit=self.eval_limit,
-                    output_index=0,
-                )
-                tops = ranked
-                self.log.emit(f"[GEN] Geração {g}/{self.generations} concluída. Top={len(ranked)}")
+                    loss_avg = _safe_float(getattr(tr, "avg_loss", getattr(tr, "final_loss", 0.0)), default=float("inf"))
+
+                    acc, _, _, _, _, _ = _eval_details_softmax(ind_name, self.train_data, self.eval_limit)
+
+                    results.append({
+                        "name": ind_name,
+                        "acc": float(acc),
+                        "loss": float(loss_avg),
+                        "generation": int(g),
+                        "individual_id": int(i),
+                    })
+
+                if not results:
+                    self.log.emit(f"[GEN] Geração {g}: nenhum resultado válido.")
+                    continue
+
+                tops = rank_top_k(results, k=min(10, len(results)))
+
+                self.log.emit(f"[GEN] Geração {g} concluída. Top={len(tops)}")
+                for t in tops[:5]:
+                    self.log.emit(f"   - {t.get('name')} | acc={t.get('acc')} | loss={t.get('loss')}")
+
+                # ✅ NOVO: se marcado, usa o melhor como base da próxima geração
+                if self.evolve_best and tops:
+                    try:
+                        best_name = str(tops[0].get("name"))
+                        if best_name:
+                            current_parent = best_name
+                            self.log.emit(f"[GEN] Base evolutiva atualizada: {current_parent}")
+                    except Exception:
+                        pass
+
                 lr = max(self.lr_min, lr * self.lr_mult)
 
             self.finished.emit(tops)
