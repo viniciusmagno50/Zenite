@@ -68,11 +68,60 @@ def _get_float(cp: ConfigParser, section: str, key: str, default: float) -> floa
         return default
 
 
+def load_training_defaults_from_appconfig(app_cfg: object) -> TrainingDefaults:
+    """
+    Se existir AppConfig e ele expor algo como:
+      app_cfg.getint('training', 'epochs_default', fallback=20)
+    usamos ele como fonte de verdade.
+
+    Se não for compatível, cai para fallback (TrainingDefaults()).
+    """
+    cfg = TrainingDefaults()
+
+    # tenta interface estilo configparser
+    try:
+        getint = getattr(app_cfg, "getint", None)
+        getfloat = getattr(app_cfg, "getfloat", None)
+        if callable(getint) and callable(getfloat):
+            epochs = int(getint("training", "epochs_default", fallback=cfg.epochs_default))
+            lr = float(getfloat("training", "lr_default", fallback=cfg.lr_default))
+            lr_mult = float(getfloat("training", "lr_mult_default", fallback=cfg.lr_mult_default))
+            lr_min_def = float(getfloat("training", "lr_min_default", fallback=cfg.lr_min_default))
+            data_update = int(getint("training", "data_update_default", fallback=cfg.data_update_default))
+            eval_limit = int(getint("training", "eval_limit_default", fallback=cfg.eval_limit_default))
+
+            epochs = max(cfg.epochs_min, min(cfg.epochs_max, epochs))
+            lr = max(cfg.lr_min, min(cfg.lr_max, lr))
+            data_update = max(cfg.data_update_min, min(cfg.data_update_max, data_update))
+            eval_limit = max(cfg.eval_limit_min, min(cfg.eval_limit_max, eval_limit))
+
+            return TrainingDefaults(
+                epochs_default=epochs,
+                lr_default=lr,
+                lr_mult_default=lr_mult,
+                lr_min_default=lr_min_def,
+                data_update_default=data_update,
+                eval_limit_default=eval_limit,
+                epochs_min=cfg.epochs_min,
+                epochs_max=cfg.epochs_max,
+                lr_min=cfg.lr_min,
+                lr_max=cfg.lr_max,
+                data_update_min=cfg.data_update_min,
+                data_update_max=cfg.data_update_max,
+                eval_limit_min=cfg.eval_limit_min,
+                eval_limit_max=cfg.eval_limit_max,
+            )
+    except Exception:
+        return cfg
+
+    return cfg
+
+
 def load_training_defaults(config_path: Optional[str | Path] = None) -> TrainingDefaults:
     """
     Carrega defaults de treino. Se config.ini não tiver [training], usa fallback.
 
-    Exemplo opcional no config.ini:
+    Exemplo no config.ini:
 
     [training]
     epochs_default = 20
@@ -104,7 +153,7 @@ def load_training_defaults(config_path: Optional[str | Path] = None) -> Training
     lr = max(cfg.lr_min, min(cfg.lr_max, lr))
 
     lr_mult = _get_float(cp, "training", "lr_mult_default", cfg.lr_mult_default)
-    lr_min = _get_float(cp, "training", "lr_min_default", cfg.lr_min_default)
+    lr_min_def = _get_float(cp, "training", "lr_min_default", cfg.lr_min_default)
 
     data_update = _get_int(cp, "training", "data_update_default", cfg.data_update_default)
     data_update = max(cfg.data_update_min, min(cfg.data_update_max, data_update))
@@ -116,7 +165,7 @@ def load_training_defaults(config_path: Optional[str | Path] = None) -> Training
         epochs_default=epochs,
         lr_default=lr,
         lr_mult_default=lr_mult,
-        lr_min_default=lr_min,
+        lr_min_default=lr_min_def,
         data_update_default=data_update,
         eval_limit_default=eval_limit,
         epochs_min=cfg.epochs_min,
