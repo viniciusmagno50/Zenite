@@ -1,10 +1,9 @@
-# pages/individual/dialogs/create_ind_dialog.py
 from __future__ import annotations
 
 import math
 import random
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, List
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIntValidator
@@ -184,8 +183,11 @@ class CreateIndDialog(QDialog):
             weights.append(self._init_layer(prev, int(n_out)))
             prev = int(n_out)
 
+        # ✅ FIX: preencher todos os campos exigidos por Structure
         structure = Structure(
             input_size=input_size,
+            output_size=output_size,
+            layers=layers,
             neurons=neurons,
             activation=activation,
             weights=weights,
