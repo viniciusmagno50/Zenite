@@ -48,13 +48,14 @@ class WdTrainingPane(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
 
-        # >>> garante tema legível do pyqtgraph (sem depender do QSS)
         pg.setConfigOptions(antialias=True, foreground=(230, 230, 230))
 
         self._train_thread: Optional[QThread] = None
         self._train_worker: Optional[TrainWorker] = None
+
         self._eval_thread: Optional[QThread] = None
         self._eval_worker: Optional[EvalWorker] = None
+
         self._gen_thread: Optional[QThread] = None
         self._gen_worker: Optional[GenerationalWorker] = None
 
@@ -79,13 +80,11 @@ class WdTrainingPane(QWidget):
 
         self.cmb_plot_update: Optional[QComboBox] = None
 
-        # >>> por dados (loss)
         self._live_loss_x: Dict[str, List[float]] = {}
         self._live_loss_y_raw: Dict[str, List[float]] = {}
         self._live_loss_y_ema: Dict[str, List[float]] = {}
         self._live_loss_ema_last: Dict[str, float] = {}
 
-        # brushes/pens visíveis
         self._pen_curve = pg.mkPen(color=(230, 230, 230), width=2)
         self._pen_bar = pg.mkPen(color=(230, 230, 230), width=1)
         self._brush_bar = pg.mkBrush(230, 230, 230)
@@ -120,7 +119,6 @@ class WdTrainingPane(QWidget):
 
         self.plot_minmax = pg.PlotWidget(title="Histograma (softmax)")
         self.plot_minmax.showGrid(x=True, y=True)
-        # >>> IMPORTANTE: autoRange X e Y (senão as barras ficam fora)
         self.plot_minmax.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
         self.plot_minmax.setLabel("left", "Bin (0..99)")
         self.plot_minmax.setLabel("bottom", "Contagem")
@@ -158,7 +156,6 @@ class WdTrainingPane(QWidget):
 
         self.plot_dist = pg.PlotWidget(title="Distribuição de saídas (predições)")
         self.plot_dist.showGrid(x=True, y=True)
-        # >>> autoRange X e Y para barras
         self.plot_dist.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
 
         self._dist_item = pg.BarGraphItem(
@@ -186,7 +183,6 @@ class WdTrainingPane(QWidget):
         self.lbl_metrics = QLabel("Acurácia: --\nLoss: --\nPerf: --\nLR: --\nNeurônios: --")
         self.lbl_metrics.setWordWrap(True)
 
-        # >>> garante texto visível mesmo com QSS agressivo
         self.lbl_progress.setStyleSheet("color: #E6E6E6;")
         self.lbl_progress_detail.setStyleSheet("color: #E6E6E6;")
         self.lbl_metrics.setStyleSheet("color: #E6E6E6;")
@@ -375,6 +371,10 @@ class WdTrainingPane(QWidget):
         self.chk_train_generations = QCheckBox("Treinar gerações")
         self.chk_train_generations.setChecked(False)
 
+        # ✅ NOVO: base evolutiva
+        self.chk_evolve_best = QCheckBox("Usar melhor como base (evolutivo)")
+        self.chk_evolve_best.setChecked(False)
+
         form = QFormLayout()
         form.setHorizontalSpacing(6)
         form.setVerticalSpacing(2)
@@ -393,6 +393,7 @@ class WdTrainingPane(QWidget):
         form.addRow("População:", self.spin_population)
 
         layout.addWidget(self.chk_train_generations)
+        layout.addWidget(self.chk_evolve_best)
         layout.addLayout(form)
         layout.addStretch(1)
         return grp
@@ -592,6 +593,10 @@ class WdTrainingPane(QWidget):
             QMessageBox.warning(self, "Treino", "Carregue os dados primeiro (1).")
             return
 
+        if (self._train_thread is not None) or (self._gen_thread is not None):
+            QMessageBox.warning(self, "Treino", "Já existe um treinamento em execução. Pare antes de iniciar outro.")
+            return
+
         self._clear_histories()
 
         epochs = int(self.spin_epochs.value())
@@ -601,17 +606,76 @@ class WdTrainingPane(QWidget):
         shuffle = bool(self.chk_shuffle.isChecked())
         update_every = int(self.spin_data_update.value())
         eval_limit = int(self.spin_eval_limit.value())
-        output_index = int(self.spin_output_index.value())
 
-        self._lock_epoch_x_axis(epochs)
-
-        # reset séries
         self._live_loss_x[name] = []
         self._live_loss_y_raw[name] = []
         self._live_loss_y_ema[name] = []
         self._live_loss_ema_last.pop(name, None)
 
-        self._log(f"[TRAIN] Iniciando treino: {name} | epochs={epochs}, lr={lr}")
+        # >>> FLUXO DE GERAÇÕES
+        if self.chk_train_generations.isChecked():
+            generations = int(self.spin_generations.value())
+            population = int(self.spin_population.value())
+
+            mut_cfg = MutationConfig(
+                allow_add_layers=bool(self.chk_allow_add_layers.isChecked()),
+                allow_remove_layers=bool(self.chk_allow_remove_layers.isChecked()),
+                max_layer_delta=max(0, int(self.spin_layer_delta.value())),
+                allow_add_neurons=bool(self.chk_allow_add_neurons.isChecked()),
+                allow_remove_neurons=bool(self.chk_allow_remove_neurons.isChecked()),
+                max_neuron_delta=max(0, int(self.spin_neuron_delta.value())),
+            )
+
+            self._log(
+                f"[GEN] Iniciando gerações: parent={name} | generations={generations}, pop={population}, "
+                f"epochs/ind={epochs}, lr={lr}, shuffle={shuffle}, "
+                f"evolutivo={bool(self.chk_evolve_best.isChecked())}"
+            )
+
+            self.btn_train.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+
+            worker = GenerationalWorker(
+                parent_name=name,
+                train_data=self._train_data,
+                epochs_per_individual=epochs,
+                learning_rate=lr,
+                lr_mult=lr_mult,
+                lr_min=lr_min,
+                eval_limit=eval_limit,
+                shuffle=shuffle,
+                generations=generations,
+                population=population,
+                mutation_cfg=mut_cfg,
+                update_every_n=update_every,
+                output_index=0,
+                batch_size=16,
+                evolve_best=bool(self.chk_evolve_best.isChecked()),
+            )
+
+            thread = QThread(self)
+            worker.moveToThread(thread)
+
+            worker.log.connect(self._log)
+            worker.error.connect(self._on_worker_error)
+            worker.stopped.connect(self._on_gen_stopped)
+            worker.progress.connect(self._on_gen_progress)
+            worker.finished.connect(self._on_gen_finished)
+
+            thread.started.connect(worker.run)
+
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+
+            self._gen_thread = thread
+            self._gen_worker = worker
+            thread.start()
+            return
+
+        # >>> FLUXO NORMAL
+        self._lock_epoch_x_axis(epochs)
+        self._log(f"[TRAIN] Iniciando treino: {name} | epochs={epochs}, lr={lr}, shuffle={shuffle}")
 
         self.btn_train.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -627,7 +691,7 @@ class WdTrainingPane(QWidget):
             eval_limit=eval_limit,
             shuffle=shuffle,
             progress_update_n=update_every,
-            output_index=output_index,
+            output_index=0,
             batch_size=16,
         )
 
@@ -655,12 +719,15 @@ class WdTrainingPane(QWidget):
     def _on_stop_clicked(self) -> None:
         if self._train_worker is not None:
             self._train_worker.stop()
-            self._log("[INFO] Solicitação de parada enviada.")
+            self._log("[INFO] Solicitação de parada enviada (treino).")
+        if self._gen_worker is not None:
+            self._gen_worker.stop()
+            self._log("[INFO] Solicitação de parada enviada (gerações).")
 
     def _on_eval_clicked(self) -> None:
         self._log("[INFO] Avaliação manual não está conectada neste arquivo (use o fluxo de treino).")
 
-    # ---------------- updates ----------------
+    # ---------------- updates (treino normal) ----------------
 
     def _on_train_progress(self, current_epoch: int, total_epochs: int) -> None:
         if total_epochs <= 0:
@@ -674,7 +741,6 @@ class WdTrainingPane(QWidget):
             p = int((step * 100) / total_steps)
             self.lbl_progress_detail.setText(f"Dados processados: {step}/{total_steps} ({p}%)")
 
-        # x contínuo em epochs
         if total_epochs > 0 and total_steps > 0:
             steps_per_epoch = float(total_steps) / float(total_epochs)
             x_frac = (float(step) / steps_per_epoch) + 1.0
@@ -685,13 +751,9 @@ class WdTrainingPane(QWidget):
         ly_raw = self._live_loss_y_raw.setdefault(net_name, [])
         ly_ema = self._live_loss_y_ema.setdefault(net_name, [])
 
-        # EMA para remover “picos por época”
         alpha = 0.10
         last = self._live_loss_ema_last.get(net_name, None)
-        if last is None:
-            ema = float(loss)
-        else:
-            ema = (alpha * float(loss)) + ((1.0 - alpha) * float(last))
+        ema = float(loss) if last is None else (alpha * float(loss)) + ((1.0 - alpha) * float(last))
         self._live_loss_ema_last[net_name] = ema
 
         if not lx or abs(lx[-1] - x_frac) > 1e-9:
@@ -732,7 +794,6 @@ class WdTrainingPane(QWidget):
         _push("counts", list(metrics.class_counts) if metrics.class_counts is not None else [])
         _push("hist100", list(getattr(metrics, "conf_hist_100", []) or [0] * 100))
 
-        # >>> mostra acurácia SEMPRE no progresso (legível)
         self.lbl_metrics.setText(
             f"Acurácia: {metrics.accuracy:.4f}\n"
             f"Loss: {metrics.loss_final:.6g} (média: {metrics.loss_avg:.6g})\n"
@@ -757,6 +818,37 @@ class WdTrainingPane(QWidget):
         self._train_thread = None
         self._train_worker = None
 
+    # ---------------- updates (gerações) ----------------
+
+    def _on_gen_progress(self, net_name: str, step: int, total_steps: int, loss: float) -> None:
+        if total_steps > 0:
+            p = int((step * 100) / total_steps)
+            self.lbl_progress_detail.setText(f"Dados processados: {step}/{total_steps} ({p}%)")
+            self.progress_bar.setValue(max(0, min(100, p)))
+        self.lbl_progress.setText(f"[GEN] {net_name} | loss={loss:.6g}")
+
+    def _on_gen_finished(self, tops: list) -> None:
+        self._last_generation_tops = list(tops or [])
+        self._log(f"[GEN] Finalizado. Tops: {len(self._last_generation_tops)}")
+        for i, r in enumerate(self._last_generation_tops[:10], 1):
+            nm = r.get("name", "?")
+            acc = r.get("acc", None)
+            loss = r.get("loss", None)
+            self._log(f"  TOP{i:02d}: {nm} | acc={acc} | loss={loss}")
+        self.btn_train.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._gen_thread = None
+        self._gen_worker = None
+
+    def _on_gen_stopped(self) -> None:
+        self._log("[INFO] Gerações interrompidas.")
+        self.btn_train.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._gen_thread = None
+        self._gen_worker = None
+
+    # ---------------- error/log ----------------
+
     def _on_worker_error(self, msg: str) -> None:
         self._log(f"[ERRO] {msg}")
         try:
@@ -780,7 +872,6 @@ class WdTrainingPane(QWidget):
         x = list(range(n))
         h = [int(v) for v in counts]
         self._dist_item.setOpts(x=x, height=h, width=1.0, pen=self._pen_bar, brush=self._brush_bar)
-        # garante range
         self.plot_dist.getPlotItem().enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
 
     def _update_plot_hist100_horizontal(self, hist100: List[int]) -> None:
@@ -811,11 +902,9 @@ class WdTrainingPane(QWidget):
         hist = self._net_hist.get(base, {})
         x_epoch = self._net_epoch_x.get(base, [])
 
-        # LOSS
         if self.chk_plot_loss_epoch.isChecked():
             if mode == self.UPDATE_BY_DATA:
                 lx = self._live_loss_x.get(base, [])
-                # >>> usa EMA para remover picos por época
                 ly = self._live_loss_y_ema.get(base, [])
                 self._ensure_curve(self._curves_loss_epoch, self.plot_loss_epoch, base).setData(lx, ly)
             else:
@@ -825,7 +914,6 @@ class WdTrainingPane(QWidget):
             if base in self._curves_loss_epoch:
                 self._curves_loss_epoch[base].setData([], [])
 
-        # LR / PERF / ACC por época
         if self.chk_plot_lr.isChecked() and x_epoch:
             self._ensure_curve(self._curves_lr, self.plot_lr, base).setData(x_epoch, hist.get("lr", []))
         else:
@@ -844,7 +932,6 @@ class WdTrainingPane(QWidget):
             if base in self._curves_acc:
                 self._curves_acc[base].setData([], [])
 
-        # Distribuição
         if self.chk_plot_dist.isChecked():
             counts_list = hist.get("counts", [])
             last_counts = counts_list[-1] if counts_list else []
@@ -852,7 +939,6 @@ class WdTrainingPane(QWidget):
         else:
             self._update_plot_dist([])
 
-        # Histograma
         if self.chk_plot_minmax.isChecked():
             h100_list = hist.get("hist100", [])
             last_h = h100_list[-1] if h100_list else []
